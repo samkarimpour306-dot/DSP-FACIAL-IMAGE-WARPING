@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(powershell -Command \"Get-ChildItem -Recurse -Force | Select-Object -ExpandProperty FullName | Sort-Object\")",
+      "Bash(mkdir \"c:\\\\Users\\\\samka\\\\Downloads\\\\DSP-FACIAL-IMAGE-WARPING-main\\\\DSP-FACIAL-IMAGE-WARPING-main\\\\emergent\\\\photix\\\\effects\")"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\samka\\Downloads\\DSP-FACIAL-IMAGE-WARPING-main\\DSP-FACIAL-IMAGE-WARPING-main\\emergent\\photix"
+    ]
+  }
+}

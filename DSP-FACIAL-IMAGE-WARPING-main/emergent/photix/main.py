@@ -202,11 +202,14 @@ class _ImgPane(tk.Frame):
 class _SliderRow(tk.Frame):
     """Compact label + tk.Scale + live value display."""
 
-    def __init__(self, parent, label, key, vmin, vmax, init, color, sv: dict, **kw):
+    def __init__(self, parent, label, key, vmin, vmax, init, color, sv: dict,
+                 on_change=None, **kw):
         super().__init__(parent, bg=BG2, **kw)
         self._key = key
         self._sv  = sv
         self._color = color
+        self._external_on_change = on_change
+        self._suppress_callback = False
         self._is_int = key in {"sigma", "glasses_x", "glasses_y", "glasses_rotate"}
 
         tk.Label(self, text=label, bg=BG2, fg=T1, font=FS,
@@ -234,9 +237,13 @@ class _SliderRow(tk.Frame):
         v = float(val)
         self._sv[self._key] = v
         self._val_var.set(self._fmt(v))
+        if not self._suppress_callback and self._external_on_change is not None:
+            self._external_on_change(self._key, v)
 
     def reset(self, val: float):
+        self._suppress_callback = True
         self._scale.set(val)
+        self._suppress_callback = False
         self._sv[self._key] = float(val)
         self._val_var.set(self._fmt(float(val)))
 
@@ -416,7 +423,7 @@ class PhotoixApp:
                           ("Age  (+)",   "age"),
                           ("De-Age (−)", "deage")]:
             ttk.Radiobutton(af, text=txt, variable=self.aging_var,
-                            value=val).pack(anchor="w", pady=1)
+                            value=val, command=self._on_aging_change).pack(anchor="w", pady=1)
         tk.Label(p, text="  σ controls strength  →  slider below",
                  bg=BG1, fg=T2, font=FS).pack(padx=10, anchor="w", pady=(0, 4))
         _sep(p)
@@ -461,6 +468,7 @@ class PhotoixApp:
             sg_row, text="Enable", variable=self.sunglasses_on,
             bg=BG1, fg=T0, selectcolor=BG3, activebackground=BG1,
             activeforeground=T0, font=FN, bd=0, highlightthickness=0,
+            command=self._on_sunglasses_toggle,
         ).pack(side=tk.LEFT, padx=(2, 0))
         _Btn(sg_row, "Add Now", self.add_sunglasses,
              accent=CYAN, fg=BG0).pack(side=tk.RIGHT, padx=(4, 0))
@@ -491,6 +499,7 @@ class PhotoixApp:
             br_row, text="Enable", variable=self.beard_on,
             bg=BG1, fg=T0, selectcolor=BG3, activebackground=BG1,
             activeforeground=T0, font=FN, bd=0, highlightthickness=0,
+            command=self._on_beard_toggle,
         ).pack(side=tk.LEFT, padx=(2, 0))
 
         color_frame = tk.Frame(p, bg=BG1)
@@ -543,7 +552,8 @@ class PhotoixApp:
             ("Aging  σ",   "sigma",   1.0, 100.0, 50.0,  AMBER),
         ]
         for lbl, key, vmin, vmax, init, color in specs:
-            row = _SliderRow(sl_inner, lbl, key, vmin, vmax, init, color, self._sv)
+            callback = self._on_expression_slider_change if key in {"smile", "eyebrow", "lip", "slim"} else None
+            row = _SliderRow(sl_inner, lbl, key, vmin, vmax, init, color, self._sv, on_change=callback)
             row.pack(fill=tk.X, pady=1)
             self._slider_rows.append(row)
 
@@ -578,6 +588,47 @@ class PhotoixApp:
         self._status_var.set(f"  {msg}")
         self._info_var.set(info)
         self.root.update_idletasks()
+
+    # ── EXCLUSIVE EFFECT SELECTION ────────────────────────────────────────────
+    def _reset_slider_value(self, key: str, value: float):
+        self._sv[key] = float(value)
+        for row in self._slider_rows:
+            if row._key == key:
+                row.reset(value)
+
+    def _clear_expression_controls(self, keep_key: str | None = None):
+        for key in ("smile", "eyebrow", "lip", "slim"):
+            if key != keep_key:
+                self._reset_slider_value(key, 0.0)
+
+    def _activate_exclusive_ability(self, ability: str, expression_key: str | None = None):
+        if ability != "expression":
+            self._clear_expression_controls()
+        else:
+            self._clear_expression_controls(keep_key=expression_key)
+
+        if ability != "aging":
+            self.aging_var.set("none")
+        if ability != "sunglasses":
+            self.sunglasses_on.set(False)
+        if ability != "beard":
+            self.beard_on.set(False)
+
+    def _on_expression_slider_change(self, key: str, value: float):
+        if abs(value) > 0.01:
+            self._activate_exclusive_ability("expression", expression_key=key)
+
+    def _on_aging_change(self):
+        if self.aging_var.get() != "none":
+            self._activate_exclusive_ability("aging")
+
+    def _on_sunglasses_toggle(self):
+        if self.sunglasses_on.get():
+            self._activate_exclusive_ability("sunglasses")
+
+    def _on_beard_toggle(self):
+        if self.beard_on.get():
+            self._activate_exclusive_ability("beard")
 
     # ── SPINNER ───────────────────────────────────────────────────────────────
     def _start_spinner(self, base: str):
@@ -1047,6 +1098,7 @@ class PhotoixApp:
             messagebox.showwarning("No face", "No face landmarks were detected.")
             return
         self.sunglasses_on.set(True)
+        self._activate_exclusive_ability("sunglasses")
         self.apply_processing()
 
     # ── APPLY PROCESSING (FR-05..24) ─────────────────────────────────────────
@@ -1178,6 +1230,9 @@ class PhotoixApp:
         for row in self._slider_rows:
             if row._key in defaults:
                 row.reset(defaults[row._key])
+        self.aging_var.set("none")
+        self.sunglasses_on.set(False)
+        self.beard_on.set(False)
         if self.current_view == "images":
             self._refresh_images()
         self._set_status("Reset to original.")
