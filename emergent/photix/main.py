@@ -32,6 +32,7 @@ from core.aging_filter      import apply_aging, apply_deaging
 from core.fft_analyzer      import compare_spectra, compute_magnitude_spectrum
 from core.metrics           import compute_all_metrics
 from core.report_exporter   import export_csv, export_pdf, save_image
+from effects.overlays       import FaceOverlayEngine
 
 # ── DESIGN TOKENS ─────────────────────────────────────────────────────────────
 BG0    = "#06080F"
@@ -263,8 +264,9 @@ class PhotoixApp:
         self._slider_rows  : list[_SliderRow] = []
 
         # control vars
-        self.warp_var  = tk.StringVar(value="delaunay")
-        self.aging_var = tk.StringVar(value="none")
+        self.warp_var           = tk.StringVar(value="delaunay")
+        self.aging_var          = tk.StringVar(value="none")
+        self.overlay_active     = tk.StringVar(value="none")
 
         self._setup_window()
         self._setup_styles()
@@ -390,6 +392,28 @@ class PhotoixApp:
                             value=val).pack(anchor="w", pady=1)
         tk.Label(p, text="  σ controls strength  →  slider below",
                  bg=BG1, fg=T2, font=FS).pack(padx=10, anchor="w", pady=(0, 4))
+        _sep(p)
+
+        # ── face overlays ─────────────────────────────────────────────────
+        _sect(p, "FACE OVERLAYS")
+        of = tk.Frame(p, bg=BG1)
+        of.pack(fill=tk.X, padx=14, pady=(0, 4))
+        tk.Label(of, text="Off", bg=BG1, fg=T1,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(2, 0))
+        ttk.Radiobutton(of, text="None", variable=self.overlay_active,
+                        value="none").pack(anchor="w", pady=1)
+        tk.Label(of, text="Sunglasses", bg=BG1, fg=T1,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(6, 0))
+        for txt, val in [("Classic", "sg_classic"), ("Aviator", "sg_aviator"),
+                          ("Round", "sg_round"), ("Clear", "sg_glasses")]:
+            ttk.Radiobutton(of, text=txt, variable=self.overlay_active,
+                            value=val).pack(anchor="w", pady=1)
+        tk.Label(of, text="Beard", bg=BG1, fg=T1,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(6, 0))
+        for txt, val in [("Black", "bd_black"), ("Brown", "bd_brown"),
+                          ("Blonde", "bd_blonde")]:
+            ttk.Radiobutton(of, text=txt, variable=self.overlay_active,
+                            value=val).pack(anchor="w", pady=1)
         _sep(p)
 
         # ── view ──────────────────────────────────────────────────────────
@@ -975,6 +999,9 @@ class PhotoixApp:
                 sigma   = self._sv["sigma"]
                 warp    = self.warp_var.get()
                 aging   = self.aging_var.get()
+                _ov     = self.overlay_active.get()
+                glasses = _ov[3:] if _ov.startswith("sg_") else "none"
+                beard   = _ov[3:] if _ov.startswith("bd_") else "none"
 
                 if lm is not None and (smile + eyebrow + lip + slim) > 0.01:
                     src_pts, dst_pts = compute_combined_displacement(
@@ -986,6 +1013,17 @@ class PhotoixApp:
                 if   aging == "age":   img = apply_aging(img, sigma, lm)
                 elif aging == "deage": img = apply_deaging(img, sigma, lm)
 
+                if lm is not None and (glasses != "none" or beard != "none"):
+                    effects_list, params = [], {}
+                    if glasses != "none":
+                        effects_list.append("sunglasses")
+                        params["sunglasses"] = {"style": glasses}
+                    if beard != "none":
+                        effects_list.append("beard")
+                        params["beard"] = {"color": beard}
+                    result = FaceOverlayEngine(lm, img).apply(effects_list, params)
+                    img = result.final_image
+
                 self.proc_img   = np.clip(img, 0, 255).astype(np.uint8)
                 self.fft_data   = compare_spectra(self.orig_img, self.proc_img)
                 self.metrics    = compute_all_metrics(self.orig_img, self.proc_img)
@@ -993,6 +1031,7 @@ class PhotoixApp:
                     "File": Path(self.current_file).name, "Warp": warp,
                     "Aging": aging, "Smile": smile, "Eyebrow": eyebrow,
                     "Lip Wide": lip, "Face Slim": slim, "Sigma": sigma,
+                    "Overlay": _ov,
                     "Timestamp": datetime.now().isoformat(),
                 }
                 self.root.after(0, self._on_processing_done)

@@ -8,12 +8,17 @@ __pycache__/
 dist/
 build/
 
+# Virtual environments
+.venv/
+venv/
+env/
+
 # Environment / secrets
 .env
 *.env
 .env.*
 
-# Claude Code settings
+# Claude Code settings (local per-machine)
 .claude/
 **/.claude/
 
@@ -28,3 +33,9 @@ Thumbs.db
 # Test cache
 .pytest_cache/
 pytest-cache-files-*/
+
+# Nested duplicate folder (historical artefact)
+DSP-FACIAL-IMAGE-WARPING-main/
+
+# Claude internal
+.sixth/

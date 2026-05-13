@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -45,6 +46,18 @@ log = logging.getLogger(__name__)
 # Minimum image dimension before detection upscaling kicks in
 # ---------------------------------------------------------------------------
 _MIN_DETECT_DIM = 64
+_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+)
+_MODEL_PATH = Path(__file__).resolve().parent.parent / "core" / "face_landmarker.task"
+
+
+def _ensure_task_model() -> str:
+    if not _MODEL_PATH.exists():
+        log.info("Downloading MediaPipe face landmarker model to %s.", _MODEL_PATH)
+        urllib.request.urlretrieve(_MODEL_URL, _MODEL_PATH)
+    return str(_MODEL_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -321,9 +334,9 @@ class BaseDetector(ABC):
 # ---------------------------------------------------------------------------
 
 class MediaPipeDetector(BaseDetector):
-    """MediaPipe FaceMesh backend (primary implementation).
+    """MediaPipe Face Landmarker Tasks backend (primary implementation).
 
-    The FaceMesh model is created once in ``__init__`` and reused across
+    The FaceLandmarker model is created once in ``__init__`` and reused across
     all ``detect()`` calls — no per-image re-initialisation overhead.
 
     Args:
@@ -349,12 +362,16 @@ class MediaPipeDetector(BaseDetector):
             ) from exc
 
         self._refine = refine
-        self._face_mesh = mp.solutions.face_mesh.FaceMesh(
-            static_image_mode=True,
-            max_num_faces=max_faces,
-            refine_landmarks=refine,
-            min_detection_confidence=min_detection_confidence,
+        base_options = mp.tasks.BaseOptions(model_asset_path=_ensure_task_model())
+        options = mp.tasks.vision.FaceLandmarkerOptions(
+            base_options=base_options,
+            running_mode=mp.tasks.vision.RunningMode.IMAGE,
+            num_faces=max_faces,
+            min_face_detection_confidence=min_detection_confidence,
+            min_face_presence_confidence=min_detection_confidence,
+            min_tracking_confidence=0.5,
         )
+        self._face_landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(options)
         log.debug(
             "MediaPipeDetector initialised (refine=%s, max_faces=%d, conf=%.2f)",
             refine, max_faces, min_detection_confidence,
@@ -384,14 +401,17 @@ class MediaPipeDetector(BaseDetector):
         rgb, scale = self._preprocess(image)
         proc_h, proc_w = rgb.shape[:2]
 
-        result = self._face_mesh.process(rgb)
+        import mediapipe as mp
 
-        if not result.multi_face_landmarks:
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        result = self._face_landmarker.detect(mp_image)
+
+        if not result.face_landmarks:
             log.debug("No face detected in image of size %dx%d.", orig_w, orig_h)
             return []
 
         faces = []
-        for face_lm in result.multi_face_landmarks:
+        for face_lm in result.face_landmarks:
             lm = self._build_landmarks(
                 face_lm,
                 proc_h, proc_w,
@@ -520,7 +540,7 @@ class MediaPipeDetector(BaseDetector):
         Returns:
             Populated :class:`FaceLandmarks` instance.
         """
-        pts = face_lm.landmark
+        pts = face_lm
         n = len(pts)
 
         normalized = np.array(
