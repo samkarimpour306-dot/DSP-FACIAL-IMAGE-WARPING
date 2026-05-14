@@ -44,6 +44,7 @@ def alpha_blend(
     bg: np.ndarray,
     fg_rgba: np.ndarray,
     center_xy: tuple[int, int],
+    alpha_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """Paste fg_rgba (H, W, 4) onto bg (H, W, 3) centered at center_xy.
 
@@ -67,6 +68,13 @@ def alpha_blend(
 
     patch = fg_rgba[fy1:fy2, fx1:fx2]
     alpha = patch[:, :, 3:4].astype(np.float32) / 255.0
+    if alpha_mask is not None:
+        mask_patch = alpha_mask[sy1:sy2, sx1:sx2].astype(np.float32)
+        if mask_patch.ndim == 3:
+            mask_patch = mask_patch[:, :, 0]
+        if mask_patch.size and float(mask_patch.max()) > 1.0:
+            mask_patch = mask_patch / 255.0
+        alpha *= np.clip(mask_patch, 0.0, 1.0)[:, :, np.newaxis]
     fg_c  = patch[:, :, :3].astype(np.float32)
     bg_r  = out[sy1:sy2, sx1:sx2].astype(np.float32)
     out[sy1:sy2, sx1:sx2] = np.clip(
@@ -104,6 +112,270 @@ def _pt(lm: np.ndarray, idx: int) -> tuple[float, float]:
 
 def _dist(lm: np.ndarray, i: int, j: int) -> float:
     return math.dist(_pt(lm, i), _pt(lm, j))
+
+
+_LOWER_LIP_EDGE = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291]
+_OUTER_LIP_RING = [
+    61, 146, 91, 181, 84, 17, 314, 405, 321, 375,
+    291, 409, 270, 269, 267, 0, 37, 39, 40, 185,
+]
+_LEFT_JAW_TO_CHIN = [172, 136, 150, 149, 176, 148, 152]
+_RIGHT_CHIN_TO_JAW = [377, 400, 378, 379, 365, 397]
+_LEFT_FULL_BEARD_REGION = [
+    93, 132, 58, 172, 136, 150, 149, 176, 148, 152,
+    17, 84, 181, 91, 146, 61,
+]
+_RIGHT_FULL_BEARD_REGION = [
+    291, 375, 321, 405, 314, 17, 152, 377, 400, 378,
+    379, 365, 397, 288, 361, 323,
+]
+_BEARD_COLOR_TARGETS_BGR: dict[str, tuple[int, int, int]] = {
+    "black": (36, 32, 28),
+    "brown": (38, 58, 92),
+    "blonde": (78, 142, 196),
+}
+
+
+def _points(lm: np.ndarray, indices: list[int]) -> list[tuple[float, float]]:
+    return [_pt(lm, idx) for idx in indices]
+
+
+def _fill_poly_mask(
+    shape: tuple[int, int],
+    points: list[tuple[float, float]],
+) -> np.ndarray:
+    mask = np.zeros(shape, dtype=np.uint8)
+    if len(points) >= 3:
+        pts = np.round(np.asarray(points, dtype=np.float32)).astype(np.int32)
+        cv2.fillPoly(mask, [pts], 255, cv2.LINE_AA)
+    return mask.astype(np.float32) / 255.0
+
+
+def _mask_bbox(mask: np.ndarray, threshold: float = 0.03) -> tuple[int, int, int, int] | None:
+    ys, xs = np.where(mask > threshold)
+    if xs.size == 0 or ys.size == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def _beard_asset_anchor_y_ratio(beard_rgba: np.ndarray) -> float:
+    """Estimate where the asset's mustache band sits vertically."""
+    if beard_rgba.ndim != 3 or beard_rgba.shape[2] < 4:
+        return 0.5
+    h, w = beard_rgba.shape[:2]
+    if h <= 0 or w <= 0:
+        return 0.5
+    x1 = max(0, int(w * 0.25))
+    x2 = min(w, int(w * 0.75))
+    central_alpha = beard_rgba[:, x1:x2, 3].astype(np.float32).mean(axis=1)
+    peak = float(central_alpha.max(initial=0.0))
+    if peak <= 1.0:
+        return 0.5
+    threshold = max(12.0, peak * 0.16)
+    rows = np.where(central_alpha > threshold)[0]
+    if rows.size == 0:
+        return 0.5
+    anchor_y = float(rows[0]) + h * 0.055
+    return float(np.clip(anchor_y / h, 0.28, 0.55))
+
+
+def _resolve_beard_target_bgr(color: str | None) -> np.ndarray | None:
+    if color is None:
+        return None
+    target = _BEARD_COLOR_TARGETS_BGR.get(color.lower())
+    if target is None:
+        return None
+    return np.array(target, dtype=np.uint8)
+
+
+def _upper_side_asset_weight(beard_rgba: np.ndarray) -> np.ndarray:
+    """Weight the upper cheek/sideburn part of a wide beard asset."""
+    h, w = beard_rgba.shape[:2]
+    if h <= 0 or w <= 0:
+        return np.zeros((0, 0), dtype=np.float32)
+    yy, xx = np.indices((h, w), dtype=np.float32)
+    xn = xx / max(float(w - 1), 1.0)
+    yn = yy / max(float(h - 1), 1.0)
+    alpha = beard_rgba[:, :, 3].astype(np.float32) / 255.0
+
+    side = np.maximum(
+        np.clip((0.46 - xn) / 0.46, 0.0, 1.0),
+        np.clip((xn - 0.54) / 0.46, 0.0, 1.0),
+    )
+    upper = np.clip((yn - 0.05) / 0.16, 0.0, 1.0) * np.clip((0.62 - yn) / 0.30, 0.0, 1.0)
+    bridge_x = np.clip((xn - 0.10) / 0.24, 0.0, 1.0) * np.clip((0.90 - xn) / 0.24, 0.0, 1.0)
+    bridge_y = np.clip((yn - 0.34) / 0.10, 0.0, 1.0) * np.clip((0.55 - yn) / 0.13, 0.0, 1.0)
+    hair = np.clip((alpha - 0.015) / 0.42, 0.0, 1.0)
+    side_weight = side * upper * hair
+    bridge_weight = bridge_x * bridge_y * hair * 0.72
+    return np.clip(np.maximum(side_weight, bridge_weight), 0.0, 1.0)
+
+
+def _boost_upper_side_beard_color(beard_rgba: np.ndarray, color: str | None) -> np.ndarray:
+    """Make upper side beard fibers carry the selected color more clearly."""
+    weight = _upper_side_asset_weight(beard_rgba)
+    if weight.size == 0 or float(weight.max(initial=0.0)) <= 0.0:
+        return beard_rgba
+
+    target_bgr = _resolve_beard_target_bgr(color)
+    if target_bgr is None:
+        target_bgr = np.array((48, 74, 112), dtype=np.uint8)
+    target_hsv = cv2.cvtColor(
+        target_bgr.reshape(1, 1, 3),
+        cv2.COLOR_BGR2HSV,
+    )[0, 0].astype(np.float32)
+
+    out = beard_rgba.copy()
+    hsv = cv2.cvtColor(out[:, :, :3], cv2.COLOR_BGR2HSV).astype(np.float32)
+    alpha = out[:, :, 3].astype(np.float32)
+
+    side_mix = np.clip(weight * 0.96, 0.0, 0.92)
+    hsv[:, :, 0] = hsv[:, :, 0] * (1.0 - side_mix) + target_hsv[0] * side_mix
+    hsv[:, :, 1] = np.maximum(hsv[:, :, 1], target_hsv[1] * (0.78 + weight * 0.34))
+    hsv[:, :, 2] = np.clip(hsv[:, :, 2] * (1.0 + weight * 0.11), 0.0, 255.0)
+    out[:, :, :3] = cv2.cvtColor(np.clip(hsv, 0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR)
+    out[:, :, 3] = np.clip(alpha + (255.0 - alpha) * weight * 0.68, 0.0, 255.0).astype(np.uint8)
+    return out
+
+
+def _tint_beard_to_color(beard_rgba: np.ndarray, color: str | None) -> np.ndarray:
+    """Apply the selected UI beard color while preserving hair texture."""
+    target_bgr = _resolve_beard_target_bgr(color)
+    if target_bgr is None:
+        return beard_rgba
+
+    out = beard_rgba.copy()
+    alpha = out[:, :, 3].astype(np.float32) / 255.0
+    hair = alpha > 0.03
+    if not np.any(hair):
+        return out
+
+    hsv = cv2.cvtColor(out[:, :, :3], cv2.COLOR_BGR2HSV).astype(np.float32)
+    target_hsv = cv2.cvtColor(
+        target_bgr.reshape(1, 1, 3),
+        cv2.COLOR_BGR2HSV,
+    )[0, 0].astype(np.float32)
+
+    values = hsv[:, :, 2][hair]
+    lo = float(np.percentile(values, 8))
+    hi = float(np.percentile(values, 98))
+    texture = np.zeros_like(alpha, dtype=np.float32)
+    if hi > lo + 1e-3:
+        texture = np.clip((hsv[:, :, 2] - lo) / (hi - lo), 0.0, 1.0)
+
+    desired_v = np.clip(target_hsv[2] * (0.54 + texture * 0.78), 0.0, 255.0)
+    mix = np.where(hair, np.clip(0.34 + alpha * 1.35, 0.0, 1.0), 0.0)
+    hue_mix = mix * 0.96
+    sat_mix = mix * 0.94
+    val_mix = mix * 0.84
+
+    hsv[:, :, 0] = np.where(
+        hair,
+        hsv[:, :, 0] * (1.0 - hue_mix) + target_hsv[0] * hue_mix,
+        hsv[:, :, 0],
+    )
+    hsv[:, :, 1] = np.where(
+        hair,
+        hsv[:, :, 1] * (1.0 - sat_mix) + target_hsv[1] * sat_mix,
+        hsv[:, :, 1],
+    )
+    hsv[:, :, 2] = np.where(
+        hair,
+        hsv[:, :, 2] * (1.0 - val_mix) + desired_v * val_mix,
+        hsv[:, :, 2],
+    )
+
+    out[:, :, :3] = cv2.cvtColor(np.clip(hsv, 0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR)
+    return _boost_upper_side_beard_color(out, color)
+
+
+def _beard_region_mask(
+    image_shape: tuple[int, int],
+    lm: np.ndarray,
+) -> np.ndarray:
+    """Soft anatomical mask for beard and mustache placement."""
+    h, w = image_shape[:2]
+    p61 = _pt(lm, 61)
+    p291 = _pt(lm, 291)
+    p164 = _pt(lm, 164)
+    p0 = _pt(lm, 0)
+    mouth_w = max(_dist(lm, 61, 291), 1.0)
+    roll_deg = math.degrees(math.atan2(p291[1] - p61[1], p291[0] - p61[0]))
+
+    lower_poly = (
+        [p61]
+        + _points(lm, _LEFT_JAW_TO_CHIN)
+        + _points(lm, _RIGHT_CHIN_TO_JAW)
+        + [p291]
+        + list(reversed(_points(lm, _LOWER_LIP_EDGE[1:-1])))
+    )
+    lower_mask = _fill_poly_mask((h, w), lower_poly)
+    left_cheek_mask = _fill_poly_mask((h, w), _points(lm, _LEFT_FULL_BEARD_REGION))
+    right_cheek_mask = _fill_poly_mask((h, w), _points(lm, _RIGHT_FULL_BEARD_REGION))
+
+    mustache_mask = np.zeros((h, w), dtype=np.float32)
+    mustache_cx = int(round((p61[0] + p291[0]) * 0.5))
+    mustache_cy = int(round(p164[1] * 0.42 + p0[1] * 0.58))
+    mustache_rx = max(2, int(round(mouth_w * 0.58)))
+    mustache_ry = max(2, int(round(mouth_w * 0.15)))
+    cv2.ellipse(
+        mustache_mask,
+        (mustache_cx, mustache_cy),
+        (mustache_rx, mustache_ry),
+        roll_deg,
+        0,
+        360,
+        1.0,
+        -1,
+        cv2.LINE_AA,
+    )
+
+    connector_mask = np.zeros((h, w), dtype=np.float32)
+    connector_ry = max(2, int(round(mouth_w * 0.24)))
+    connector_rx = max(2, int(round(mouth_w * 0.32)))
+    connector_y = int(round(mustache_cy + mouth_w * 0.09))
+    connector_x_offset = mouth_w * 0.34
+    for side in (-1, 1):
+        connector_cx = int(round(mustache_cx + side * connector_x_offset))
+        cv2.ellipse(
+            connector_mask,
+            (connector_cx, connector_y),
+            (connector_rx, connector_ry),
+            roll_deg + side * 18.0,
+            0,
+            360,
+            1.0,
+            -1,
+            cv2.LINE_AA,
+        )
+
+    lip_mask = _fill_poly_mask((h, w), _points(lm, _OUTER_LIP_RING))
+    guard_radius = max(1, int(round(mouth_w * 0.025)))
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (guard_radius * 2 + 1, guard_radius * 2 + 1),
+    )
+    lip_guard = cv2.dilate(
+        np.clip(lip_mask * 255.0, 0, 255).astype(np.uint8),
+        kernel,
+        iterations=1,
+    ).astype(np.float32) / 255.0
+    lip_guard = cv2.GaussianBlur(
+        lip_guard,
+        (0, 0),
+        sigmaX=max(0.8, mouth_w * 0.015),
+        sigmaY=max(0.8, mouth_w * 0.015),
+    )
+
+    mask = np.clip(
+        lower_mask + left_cheek_mask + right_cheek_mask + mustache_mask + connector_mask,
+        0.0,
+        1.0,
+    )
+    edge_sigma = max(1.0, mouth_w * 0.018)
+    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=edge_sigma, sigmaY=edge_sigma)
+    mask *= 1.0 - np.clip(lip_guard, 0.0, 1.0)
+    return np.clip(mask, 0.0, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +554,7 @@ def apply_beard(
     image: np.ndarray,
     landmarks: np.ndarray,
     asset_path: str | None = None,
+    color: str = "black",
     scale_multiplier: float = 1.0,
     offset_x: int = 0,
     offset_y: int = 0,
@@ -297,8 +570,8 @@ def apply_beard(
         172 = left jaw              397 = right jaw
         61  = left mouth corner     291 = right mouth corner
 
-    Height-dominant scaling: beard height spans lm164→lm152 × 1.10.
-    Paste center = midpoint of lm164 and lm152 (top edge lands at philtrum).
+    Scaling follows the full cheek/jaw beard mask.
+    The asset's central mustache band is aligned to the philtrum/top-lip anchor.
     """
     lm = landmarks
 
@@ -308,6 +581,7 @@ def apply_beard(
     p397 = _pt(lm, 397)
     p61  = _pt(lm, 61)
     p291 = _pt(lm, 291)
+    p0   = _pt(lm, 0)
 
     jaw_span         = _dist(lm, 172, 397)
     philtrum_to_chin = _dist(lm, 164, 152)
@@ -329,10 +603,17 @@ def apply_beard(
                 squash = 1.0 - 0.4 * abs(yaw_ratio)
         squash = float(np.clip(squash, 0.3, 1.0))
 
-    # Height-dominant target: beard spans philtrum→chin × 1.10
-    # Width is secondary constraint; take smaller scale factor so neither axis overflows
-    target_h = max(4, int(philtrum_to_chin * 1.10 * scale_multiplier))
-    target_w = max(4, int(jaw_span * 1.15 * scale_multiplier * squash))
+    # Full-beard target covers cheek, jaw, chin, and mustache regions.
+    region_mask = _beard_region_mask(image.shape[:2], lm)
+    region_bbox = _mask_bbox(region_mask)
+    if region_bbox is not None:
+        rx1, ry1, rx2, ry2 = region_bbox
+        paste_cx_base = (rx1 + rx2) / 2.0
+        target_h = max(4, int((ry2 - ry1) * scale_multiplier))
+        target_w = max(4, int((rx2 - rx1) * scale_multiplier))
+    else:
+        target_h = max(4, int(philtrum_to_chin * 1.18 * scale_multiplier))
+        target_w = max(4, int(jaw_span * 1.25 * scale_multiplier * squash))
 
     resolved = Path(asset_path) if asset_path else (_ASSETS_DIR / "beard.png")
     if resolved.is_file():
@@ -362,9 +643,12 @@ def apply_beard(
                 cr = int(np.where(cols_nz)[0][-1]) + 1
                 sg = sg[ct:cb, cl:cr]
 
-            # Color match: tint toward scalp hair color at 60% HSV strength
+            # Prefer explicit UI colors; fall back to scalp matching for custom callers.
             if color_match:
-                sg = _tint_beard_from_scalp(sg, image, lm)
+                if _resolve_beard_target_bgr(color) is not None:
+                    sg = _tint_beard_to_color(sg, color)
+                else:
+                    sg = _tint_beard_from_scalp(sg, image, lm)
 
             # Feather alpha edges with 7×7 blur
             sg = sg.copy()
@@ -372,10 +656,10 @@ def apply_beard(
 
             # Height-dominant scale; floor prevents invisible beard for portrait assets
             ah, aw = sg.shape[:2]
+            anchor_y_ratio = _beard_asset_anchor_y_ratio(sg)
             s_h = target_h / max(ah, 1)
             s_w = target_w / max(aw, 1)
-            s   = min(s_h, s_w)
-            s   = max(s, s_w * 0.45)
+            s   = max(s_h, s_w) * 1.02
             rw  = max(4, int(aw * s))
             rh  = max(4, int(ah * s))
             interp  = cv2.INTER_AREA if s < 1.0 else cv2.INTER_CUBIC
@@ -383,12 +667,12 @@ def apply_beard(
 
             rotated = _rotate_asset(resized, -roll_deg)
 
-            # Paste center = midpoint between philtrum (lm164) and chin (lm152)
-            # This anchors the top edge of the beard at lm164 (philtrum / upper lip)
+            # Align the source mustache band to the target upper-lip region.
             paste_cx = int(paste_cx_base + offset_x)
-            paste_cy = int((p164[1] + p152[1]) / 2.0 + offset_y)
+            mustache_target_y = p164[1] * 0.42 + p0[1] * 0.58
+            paste_cy = int(mustache_target_y + rh * (0.5 - anchor_y_ratio) + offset_y)
 
-            out = alpha_blend(image, rotated, (paste_cx, paste_cy))
+            out = alpha_blend(image, rotated, (paste_cx, paste_cy), alpha_mask=region_mask)
 
             if debug:
                 for idx in (164, 152, 172, 397):
@@ -401,7 +685,7 @@ def apply_beard(
             return out
 
     # Procedural fallback
-    return _procedural_beard(image, lm, scale_multiplier, squash)
+    return _procedural_beard(image, lm, scale_multiplier, squash, color)
 
 
 def _tint_beard_from_scalp(
@@ -462,58 +746,87 @@ def _procedural_beard(
     lm: np.ndarray,
     scale: float,
     squash: float,
+    color: str = "black",
 ) -> np.ndarray:
     """Draw a beard with OpenCV fill + directional noise texture."""
     h, w = image.shape[:2]
+    beard_mask = _beard_region_mask((h, w), lm)
+    if float(beard_mask.max(initial=0.0)) <= 0.0:
+        return image.copy()
 
-    def lp(idx: int) -> tuple[float, float]:
-        return _pt(lm, idx)
+    mouth_w = max(_dist(lm, 61, 291), 1.0)
+    face_cx = (_pt(lm, 61)[0] + _pt(lm, 291)[0]) * 0.5
+    lower_lip_y = _pt(lm, 17)[1]
+    base_bgr = _resolve_beard_target_bgr(color)
+    if base_bgr is None:
+        base_bgr = np.array(_BEARD_COLOR_TARGETS_BGR["black"], dtype=np.uint8)
+    base_color = base_bgr.astype(np.float32)
 
-    chin    = lp(152)
-    l_mouth = lp(61);   r_mouth = lp(291)
-    lip_bot = lp(17)
-    left_jaw  = [lp(i) for i in [172, 136, 150, 149, 176, 148]]
-    right_jaw = [lp(i) for i in [377, 400, 378, 379, 365, 397]]
-    lip_edge  = [lp(i) for i in [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291]]
-
-    face_cx = (l_mouth[0] + r_mouth[0]) / 2.0
-    face_cy = (l_mouth[1] + chin[1]) / 2.0
-    ref = (face_cx, face_cy)
-
-    def _expand(pt, ref, s):
-        dx, dy = pt[0] - ref[0], pt[1] - ref[1]
-        return (pt[0] + dx * (s - 1.0) * squash, pt[1] + dy * (s - 1.0))
-
-    left_jaw  = [_expand(p, ref, scale) for p in left_jaw]
-    right_jaw = [_expand(p, ref, scale) for p in right_jaw]
-    chin_exp  = _expand(chin, ref, scale)
-
-    beard_poly = (
-        [l_mouth] + left_jaw + [chin_exp] + list(reversed(right_jaw)) + [r_mouth]
-        + list(reversed(lip_edge[1:-1]))
+    feather = cv2.GaussianBlur(
+        beard_mask,
+        (0, 0),
+        sigmaX=max(1.2, mouth_w * 0.018),
+        sigmaY=max(1.2, mouth_w * 0.018),
     )
-    poly_pts = np.array([[int(p[0]), int(p[1])] for p in beard_poly], dtype=np.int32)
+    alpha_strength = float(np.clip(0.62 + (scale - 1.0) * 0.12, 0.42, 0.82))
+    out = image.astype(np.float32)
+    alpha = (feather * alpha_strength)[:, :, np.newaxis]
+    out = out * (1.0 - alpha) + base_color * alpha
 
-    base_color = (14, 13, 12)
-    overlay    = image.copy()
-    beard_mask = np.zeros((h, w), dtype=np.float32)
+    rng = np.random.default_rng(42)
+    noise = rng.normal(0.0, 1.0, (h, w)).astype(np.float32)
+    noise = cv2.GaussianBlur(noise, (1, 9), 0)
+    noise -= float(noise.min())
+    denom = float(noise.max())
+    if denom > 1e-6:
+        noise /= denom
+    out -= noise[:, :, np.newaxis] * beard_mask[:, :, np.newaxis] * 22.0
 
-    cv2.fillPoly(overlay, [poly_pts], base_color, cv2.LINE_AA)
-    cv2.fillPoly(beard_mask, [poly_pts], 1.0, cv2.LINE_AA)
+    ys, xs = np.where(beard_mask > 0.22)
+    if xs.size:
+        count = min(2200, max(220, xs.size // 38))
+        chosen = rng.choice(xs.size, size=count, replace=xs.size < count)
+        strand_layer = np.zeros((h, w, 3), dtype=np.float32)
+        strand_alpha = np.zeros((h, w), dtype=np.float32)
+        min_len = max(2.0, mouth_w * 0.022)
+        max_len = max(min_len + 1.0, mouth_w * 0.070)
 
-    rng        = np.random.default_rng(42)
-    noise      = rng.integers(0, 60, (h, w), dtype=np.uint8)
-    noise_blur = cv2.GaussianBlur(noise, (1, 9), 0)
-    noise_3ch  = cv2.merge([noise_blur, noise_blur, noise_blur]).astype(np.float32)
-    mask_3ch   = beard_mask[:, :, np.newaxis]
-    overlay_f  = np.clip(overlay.astype(np.float32) - noise_3ch * mask_3ch * 0.35, 0, 255)
-    overlay    = overlay_f.astype(np.uint8)
+        for idx in np.atleast_1d(chosen):
+            x = float(xs[idx])
+            y = float(ys[idx])
+            if y < lower_lip_y:
+                angle = 0.12 if x >= face_cx else math.pi - 0.12
+            else:
+                side = np.clip((x - face_cx) / max(mouth_w * 1.8, 1.0), -0.48, 0.48)
+                angle = math.pi * 0.5 + side
+            length = float(rng.uniform(min_len, max_len))
+            dx = math.cos(angle) * length * 0.5
+            dy = math.sin(angle) * length * 0.5
+            p1 = (int(round(x - dx)), int(round(y - dy)))
+            p2 = (int(round(x + dx)), int(round(y + dy)))
+            color = np.clip(base_color + rng.normal(0.0, 8.0, 3), 0.0, 90.0)
+            cv2.line(
+                strand_layer,
+                p1,
+                p2,
+                tuple(float(c) for c in color),
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.line(
+                strand_alpha,
+                p1,
+                p2,
+                float(rng.uniform(0.18, 0.55)),
+                1,
+                cv2.LINE_AA,
+            )
 
-    feather_mask = cv2.GaussianBlur(beard_mask, (0, 0), sigmaX=6, sigmaY=3)
-    out    = image.copy().astype(np.float32)
-    ov     = overlay.astype(np.float32)
-    alpha3 = feather_mask[:, :, np.newaxis] * 0.88
-    return np.clip(ov * alpha3 + out * (1.0 - alpha3), 0, 255).astype(np.uint8)
+        strand_alpha = cv2.GaussianBlur(strand_alpha, (0, 0), 0.35)
+        strand_a = np.clip(strand_alpha * beard_mask * 0.9, 0.0, 0.85)[:, :, np.newaxis]
+        out = out * (1.0 - strand_a) + strand_layer * strand_a
+
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
@@ -634,6 +947,7 @@ class FaceOverlayEngine:
         out   = apply_beard(
             image, self._pixels,
             asset_path=None,
+            color=color,
             scale_multiplier=float(scale),
             offset_x=int(offset_x),
             offset_y=int(offset_y),
@@ -660,6 +974,7 @@ class FaceOverlayEngine:
         out   = apply_beard(
             image, self._pixels,
             asset_path=png_path or str(_ASSETS_DIR / "beard.png"),
+            color=color,
             scale_multiplier=float(scale),
             offset_x=int(offset_x),
             offset_y=int(offset_y),
