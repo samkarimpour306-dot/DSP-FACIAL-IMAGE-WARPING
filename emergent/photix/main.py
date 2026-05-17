@@ -3,6 +3,7 @@ main.py — Photix v2  ·  Facial Image Processing Studio
 Native-tkinter image display + tk.Scale sliders (no matplotlib overhead for images).
 """
 import sys
+import logging
 import threading
 from pathlib import Path
 from datetime import datetime
@@ -21,6 +22,7 @@ from matplotlib.gridspec import GridSpec
 
 _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE))
+_log = logging.getLogger(__name__)
 
 from core.image_loader      import load_image, preprocess
 from core.landmark_detector import detect_landmarks, draw_landmarks
@@ -29,6 +31,7 @@ from core.mesh_warper       import apply_delaunay_warp
 from core.flow_warper       import apply_optical_flow_warp
 from core.tps_warper        import apply_tps_warp
 from core.aging_filter      import apply_aging, apply_deaging
+from core.filters           import apply_lowpass_filter, apply_highpass_filter, FilterType
 from core.fft_analyzer      import compare_spectra, compute_magnitude_spectrum
 from core.metrics           import compute_all_metrics
 from core.report_exporter   import export_csv, export_pdf, save_image
@@ -188,15 +191,16 @@ class _ImgPane(tk.Frame):
 class _SliderRow(tk.Frame):
     """Compact label + tk.Scale + live value display."""
 
-    def __init__(self, parent, label, key, vmin, vmax, init, color, sv: dict, **kw):
+    def __init__(self, parent, label, key, vmin, vmax, init, color, sv: dict, on_change_cmd=None, **kw):
         super().__init__(parent, bg=BG2, **kw)
         self._key = key
         self._sv  = sv
         self._color = color
-        self._is_sigma = (key == "sigma")
+        self._on_change_cmd = on_change_cmd
+        self._is_sigma = (key in ("sigma", "lowpass_sigma", "highpass_sigma"))
 
         tk.Label(self, text=label, bg=BG2, fg=T1, font=FS,
-                 width=9, anchor="w").pack(side=tk.LEFT, padx=(6, 0))
+                 width=11, anchor="w").pack(side=tk.LEFT, padx=(6, 0))
 
         self._val_var = tk.StringVar(value=self._fmt(init))
         tk.Label(self, textvariable=self._val_var, bg=BG2, fg=color,
@@ -220,6 +224,9 @@ class _SliderRow(tk.Frame):
         v = float(val)
         self._sv[self._key] = v
         self._val_var.set(self._fmt(v))
+        # Auto-trigger processing for filter sliders
+        if self._on_change_cmd and self._key in ("lowpass_sigma", "highpass_sigma"):
+            self._on_change_cmd()
 
     def reset(self, val: float):
         self._scale.set(val)
@@ -260,13 +267,16 @@ class PhotoixApp:
         self._cam_candidate_idx = 0
 
         # slider values
-        self._sv           = dict(smile=0.0, eyebrow=0.0, lip=0.0, slim=0.0, sigma=50.0)
+        self._sv           = dict(smile=0.0, eyebrow=0.0, lip=0.0, slim=0.0, sigma=50.0, 
+                                  lowpass_sigma=0.0, highpass_sigma=0.0)
         self._slider_rows  : list[_SliderRow] = []
 
         # control vars
         self.warp_var           = tk.StringVar(value="delaunay")
         self.aging_var          = tk.StringVar(value="none")
         self.overlay_active     = tk.StringVar(value="none")
+        self.lowpass_enabled    = tk.BooleanVar(value=False)
+        self.highpass_enabled   = tk.BooleanVar(value=False)
 
         self._setup_window()
         self._setup_styles()
@@ -394,6 +404,28 @@ class PhotoixApp:
                  bg=BG1, fg=T2, font=FS).pack(padx=10, anchor="w", pady=(0, 4))
         _sep(p)
 
+        # ── frequency filters ─────────────────────────────────────────────
+        _sect(p, "FREQUENCY FILTERS")
+        ff = tk.Frame(p, bg=BG1)
+        ff.pack(fill=tk.X, padx=14, pady=(2, 4))
+        
+        # Low-pass checkbox - auto-apply on toggle
+        cb_lp = ttk.Checkbutton(ff, text="✓ Low-Pass (Smoothing)", 
+                       variable=self.lowpass_enabled,
+                       command=self.apply_processing)
+        cb_lp.pack(anchor="w", pady=2)
+        tk.Label(ff, text="  Use slider below to adjust strength", 
+                bg=BG1, fg=T2, font=FS).pack(padx=10, anchor="w", pady=(0, 1))
+        
+        # High-pass checkbox - auto-apply on toggle
+        cb_hp = ttk.Checkbutton(ff, text="✓ High-Pass (Sharpening)", 
+                       variable=self.highpass_enabled,
+                       command=self.apply_processing)
+        cb_hp.pack(anchor="w", pady=2)
+        tk.Label(ff, text="  Use slider below to adjust strength", 
+                bg=BG1, fg=T2, font=FS).pack(padx=10, anchor="w", pady=(0, 4))
+        _sep(p)
+
         # ── face overlays ─────────────────────────────────────────────────
         _sect(p, "FACE OVERLAYS")
         of = tk.Frame(p, bg=BG1)
@@ -474,15 +506,18 @@ class PhotoixApp:
         sl_inner.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
 
         specs = [
-            ("Smile",      "smile",   0.0,   1.0,  0.0,  VIOLET),
-            ("Eyebrow",    "eyebrow", 0.0,   1.0,  0.0,  CYAN),
-            ("Lip Wide",   "lip",     0.0,   1.0,  0.0,  GREEN),
-            ("Face Slim",  "slim",    0.0,   1.0,  0.0,  PINK),
-            ("Aging  σ",   "sigma",   1.0, 100.0, 50.0,  AMBER),
+            ("Smile",          "smile",            0.0,   1.0,  0.0,  VIOLET),
+            ("Eyebrow",        "eyebrow",          0.0,   1.0,  0.0,  CYAN),
+            ("Lip Wide",       "lip",              0.0,   1.0,  0.0,  GREEN),
+            ("Face Slim",      "slim",             0.0,   1.0,  0.0,  PINK),
+            ("Aging σ",        "sigma",            1.0, 100.0, 50.0,  AMBER),
+            ("LP Filter σ",    "lowpass_sigma",    0.0,  40.0,  0.0,  CYAN),
+            ("HP Filter σ",    "highpass_sigma",   0.0,  30.0,  0.0,  VIOLET),
         ]
         self._slider_rows = []
         for lbl, key, vmin, vmax, init, color in specs:
-            row = _SliderRow(sl_inner, lbl, key, vmin, vmax, init, color, self._sv)
+            row = _SliderRow(sl_inner, lbl, key, vmin, vmax, init, color, self._sv, 
+                           on_change_cmd=self.apply_processing)
             row.pack(fill=tk.X, pady=1)
             self._slider_rows.append(row)
 
@@ -1013,6 +1048,28 @@ class PhotoixApp:
                 if   aging == "age":   img = apply_aging(img, sigma, lm)
                 elif aging == "deage": img = apply_deaging(img, sigma, lm)
 
+                # ── Apply frequency-domain filters ───────────────────────
+                # Low-pass (smoothing)
+                if self.lowpass_enabled.get() and self._sv["lowpass_sigma"] > 0.5:
+                    try:
+                        lp_sigma = float(self._sv["lowpass_sigma"])
+                        img = apply_lowpass_filter(img, sigma=lp_sigma, filter_type=FilterType.GAUSSIAN)
+                    except Exception as e:
+                        _log.warning(f"Low-pass filter failed: {e}")
+                
+                # High-pass (sharpening) - blend for visible enhancement
+                if self.highpass_enabled.get() and self._sv["highpass_sigma"] > 0.5:
+                    try:
+                        hp_sigma = float(self._sv["highpass_sigma"])
+                        hp_result = apply_highpass_filter(img, sigma=hp_sigma, filter_type=FilterType.GAUSSIAN)
+                        # Blend: keep 70% original, add 30% high-pass for enhancement
+                        blend_amt = min(0.5, hp_sigma / 100.0)  # Scale blend by sigma
+                        img = cv2.addWeighted(img.astype(np.float32), 0.7, 
+                                             hp_result.astype(np.float32), 0.3 * blend_amt, 0)
+                        img = np.clip(img, 0, 255).astype(np.uint8)
+                    except Exception as e:
+                        _log.warning(f"High-pass filter failed: {e}")
+
                 if lm is not None and (glasses != "none" or beard != "none"):
                     effects_list, params = [], {}
                     if glasses != "none":
@@ -1031,6 +1088,8 @@ class PhotoixApp:
                     "File": Path(self.current_file).name, "Warp": warp,
                     "Aging": aging, "Smile": smile, "Eyebrow": eyebrow,
                     "Lip Wide": lip, "Face Slim": slim, "Sigma": sigma,
+                    "LowPass": self.lowpass_enabled.get(), "LowPass σ": self._sv["lowpass_sigma"],
+                    "HighPass": self.highpass_enabled.get(), "HighPass σ": self._sv["highpass_sigma"],
                     "Overlay": _ov,
                     "Timestamp": datetime.now().isoformat(),
                 }

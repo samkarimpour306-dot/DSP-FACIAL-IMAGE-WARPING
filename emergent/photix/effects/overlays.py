@@ -430,7 +430,9 @@ def apply_sunglasses(
                 raw = cv2.cvtColor(raw, cv2.COLOR_BGR2BGRA)
 
             ah, aw = raw.shape[:2]
-            target_h = max(1, int(target_w * ah / aw))
+            # Preserve aspect ratio: calculate height based on width
+            aspect_ratio = float(ah) / float(max(aw, 1))
+            target_h = max(1, int(round(target_w * aspect_ratio)))
             interp   = cv2.INTER_AREA if target_w < aw else cv2.INTER_CUBIC
             resized  = cv2.resize(raw, (target_w, target_h), interpolation=interp)
 
