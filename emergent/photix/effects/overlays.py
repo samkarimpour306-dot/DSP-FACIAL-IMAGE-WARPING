@@ -6,6 +6,7 @@ Landmark-accurate sunglasses and beard compositing using MediaPipe Face Mesh.
 from __future__ import annotations
 
 import logging
+import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,7 +21,22 @@ except ImportError:
     _FaceLandmarks = None
 
 _ASSETS_DIR = Path(__file__).parent / "assets"
+_HAIR_DIR = _ASSETS_DIR / "hair"
 _log = logging.getLogger(__name__)
+
+
+def _load_hair_catalog() -> dict[str, Any]:
+    catalog_path = _HAIR_DIR / "hair_catalog.json"
+    if not catalog_path.is_file():
+        return {}
+
+    try:
+        with open(catalog_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        _log.warning(f"Hair catalog could not be loaded: {e}")
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +150,76 @@ _BEARD_COLOR_TARGETS_BGR: dict[str, tuple[int, int, int]] = {
     "brown": (38, 58, 92),
     "blonde": (78, 142, 196),
 }
+
+_HAIR_COLOR_TARGETS_BGR: dict[str, tuple[int, int, int]] = {
+    "black":  (30, 30, 30),
+    "brown":  (50, 75, 110),
+    "blonde": (95, 170, 220),
+    "red":    (45, 75, 170),
+    "blue":   (170, 110, 40),
+    "gray":   (150, 150, 150),
+}
+
+def _resolve_hair_target_bgr(color: str | None) -> np.ndarray | None:
+    if color is None:
+        return None
+    if color.lower() == "original":
+        return None
+    target = _HAIR_COLOR_TARGETS_BGR.get(color.lower())
+    if target is None:
+        return None
+    return np.array(target, dtype=np.uint8)
+
+def _tint_hair_to_color(hair_rgba: np.ndarray, color: str | None) -> np.ndarray:
+    target_bgr = _resolve_hair_target_bgr(color)
+    if target_bgr is None:
+        return hair_rgba
+
+    out = hair_rgba.copy()
+    alpha = out[:, :, 3].astype(np.float32) / 255.0
+    hair_mask = alpha > 0.03
+    if not np.any(hair_mask):
+        return out
+
+    hsv = cv2.cvtColor(out[:, :, :3], cv2.COLOR_BGR2HSV).astype(np.float32)
+    target_hsv = cv2.cvtColor(
+        target_bgr.reshape(1, 1, 3),
+        cv2.COLOR_BGR2HSV,
+    )[0, 0].astype(np.float32)
+
+    values = hsv[:, :, 2][hair_mask]
+    lo = float(np.percentile(values, 8))
+    hi = float(np.percentile(values, 98))
+
+    texture = np.zeros_like(alpha, dtype=np.float32)
+    if hi > lo + 1e-3:
+        texture = np.clip((hsv[:, :, 2] - lo) / (hi - lo), 0.0, 1.0)
+
+    desired_v = np.clip(target_hsv[2] * (0.55 + texture * 0.75), 0.0, 255.0)
+
+    mix = np.where(hair_mask, np.clip(0.35 + alpha * 1.2, 0.0, 1.0), 0.0)
+    hue_mix = mix * 0.95
+    sat_mix = mix * 0.90
+    val_mix = mix * 0.80
+
+    hsv[:, :, 0] = np.where(
+        hair_mask,
+        hsv[:, :, 0] * (1.0 - hue_mix) + target_hsv[0] * hue_mix,
+        hsv[:, :, 0],
+    )
+    hsv[:, :, 1] = np.where(
+        hair_mask,
+        hsv[:, :, 1] * (1.0 - sat_mix) + target_hsv[1] * sat_mix,
+        hsv[:, :, 1],
+    )
+    hsv[:, :, 2] = np.where(
+        hair_mask,
+        hsv[:, :, 2] * (1.0 - val_mix) + desired_v * val_mix,
+        hsv[:, :, 2],
+    )
+
+    out[:, :, :3] = cv2.cvtColor(np.clip(hsv, 0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR)
+    return out
 
 
 def _points(lm: np.ndarray, indices: list[int]) -> list[tuple[float, float]]:
@@ -830,6 +916,98 @@ def _procedural_beard(
 
     return np.clip(out, 0, 255).astype(np.uint8)
 
+def apply_hair(
+    image: np.ndarray,
+    landmarks: np.ndarray,
+    style: str = "none",
+    color: str = "original",
+    scale_multiplier: float = 1.0,
+    offset_x: int = 0,
+    offset_y: int = 0,
+    rotation_offset_deg: float = 0.0,
+) -> np.ndarray:
+    """Apply a hair PNG overlay using face landmarks and hair catalog metadata."""
+    if style == "none":
+        return image
+
+    catalog = _load_hair_catalog()
+    entry = catalog.get(style)
+    if not entry:
+        _log.warning(f"Hair style not found in catalog: {style}")
+        return image
+
+    file_name = entry.get("file")
+    if not file_name:
+        _log.warning(f"Hair style has no file entry: {style}")
+        return image
+
+    asset_path = _HAIR_DIR / file_name
+    if not asset_path.is_file():
+        _log.warning(f"Hair asset not found: {asset_path}")
+        return image
+
+    raw = cv2.imread(str(asset_path), cv2.IMREAD_UNCHANGED)
+    if raw is None:
+        _log.warning(f"Hair asset could not be loaded: {asset_path}")
+        return image
+
+    if raw.ndim == 2:
+        raw = cv2.cvtColor(raw, cv2.COLOR_GRAY2BGRA)
+    elif raw.shape[2] == 3:
+        raw = cv2.cvtColor(raw, cv2.COLOR_BGR2BGRA)
+
+    hair = raw.copy()
+
+    # Crop transparent empty margins
+    alpha = hair[:, :, 3]
+    rows_nz = np.any(alpha > 10, axis=1)
+    cols_nz = np.any(alpha > 10, axis=0)
+    if rows_nz.any() and cols_nz.any():
+        top = int(np.where(rows_nz)[0][0])
+        bottom = int(np.where(rows_nz)[0][-1]) + 1
+        left = int(np.where(cols_nz)[0][0])
+        right = int(np.where(cols_nz)[0][-1]) + 1
+        hair = hair[top:bottom, left:right]
+
+    # Optional recolor
+    hair = _tint_hair_to_color(hair, color)
+
+    # Soften alpha edges a little
+    hair[:, :, 3] = cv2.GaussianBlur(hair[:, :, 3], (5, 5), 0)
+
+    lm = landmarks
+    p234 = _pt(lm, 234)
+    p454 = _pt(lm, 454)
+    p10 = _pt(lm, 10)
+    p152 = _pt(lm, 152)
+    p33 = _pt(lm, 33)
+    p263 = _pt(lm, 263)
+
+    face_width = max(_dist(lm, 234, 454), 1.0)
+    face_height = max(_dist(lm, 10, 152), 1.0)
+
+    roll_deg = math.degrees(math.atan2(p263[1] - p33[1], p263[0] - p33[0]))
+    roll_deg += rotation_offset_deg
+
+    scale_x = float(entry.get("scale_x", 1.6))
+    scale_y = float(entry.get("scale_y", 1.15))
+    meta_offset_x = int(entry.get("offset_x", 0))
+    meta_offset_y_ratio = float(entry.get("offset_y", -0.55))
+
+    ah, aw = hair.shape[:2]
+    target_w = max(8, int(face_width * scale_x * scale_multiplier))
+    base_h = max(8, int(ah * (target_w / max(aw, 1))))
+    target_h = max(8, int(base_h * scale_y))
+
+    interp = cv2.INTER_AREA if target_w < aw else cv2.INTER_CUBIC
+    hair = cv2.resize(hair, (target_w, target_h), interpolation=interp)
+
+    rotated = _rotate_asset(hair, -roll_deg)
+
+    center_x = int(p10[0] + meta_offset_x + offset_x)
+    center_y = int(p10[1] + target_h * meta_offset_y_ratio + offset_y)
+
+    return alpha_blend(image, rotated, (center_x, center_y))
 
 # ---------------------------------------------------------------------------
 # FaceOverlayEngine  (delegates to module-level functions)
@@ -839,11 +1017,12 @@ class FaceOverlayEngine:
     """Applies declarative overlay effects to a face image."""
 
     _EFFECT_REGISTRY: dict[str, str] = {
-        "sunglasses":     "_effect_sunglasses",
-        "sunglasses_png": "_effect_sunglasses_png",
-        "beard":          "_effect_beard",
-        "beard_png":      "_effect_beard_png",
-    }
+    "sunglasses":     "_effect_sunglasses",
+    "sunglasses_png": "_effect_sunglasses_png",
+    "beard":          "_effect_beard",
+    "beard_png":      "_effect_beard_png",
+    "hair":           "_effect_hair",
+        }
 
     def __init__(self, landmarks, image: np.ndarray) -> None:
         if isinstance(landmarks, np.ndarray):
@@ -989,11 +1168,39 @@ class FaceOverlayEngine:
         }
         return out, {"beard_region": blank}, meta
 
+    def _effect_hair(
+        self,
+        image: np.ndarray,
+        style: str = "none",
+        color: str = "original",
+        offset_x: float = 0.0,
+        offset_y: float = 0.0,
+        scale: float = 1.0,
+        rotation: float = 0.0,
+        ) -> tuple[np.ndarray, dict, dict]:
+        out = apply_hair(
+            image, self._pixels,
+            style=style,
+            color=color,
+            scale_multiplier=float(scale),
+            offset_x=int(offset_x),
+            offset_y=int(offset_y),
+            rotation_offset_deg=float(rotation),
+         )
+        blank = np.zeros(image.shape[:2], dtype=np.float32)
+        meta = {
+            "hair_style": style,
+            "hair_color": color,
+            "dsp_technique": "hair PNG overlay compositing",
+     }
+        return out, {"hair_region": blank}, meta
+
     # Keep old names as aliases so any external callers still work
     _apply_sunglasses     = _effect_sunglasses
     _apply_sunglasses_png = _effect_sunglasses_png
     _apply_beard          = _effect_beard
     _apply_beard_png      = _effect_beard_png
+    _apply_hair           = _effect_hair 
 
 
 # ---------------------------------------------------------------------------
