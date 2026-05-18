@@ -277,6 +277,9 @@ class PhotoixApp:
         self.overlay_active     = tk.StringVar(value="none")
         self.lowpass_enabled    = tk.BooleanVar(value=False)
         self.highpass_enabled   = tk.BooleanVar(value=False)
+        self.hair_style_var     = tk.StringVar(value="none")
+        self.hair_color_var     = tk.StringVar(value="original")
+
 
         self._setup_window()
         self._setup_styles()
@@ -446,6 +449,32 @@ class PhotoixApp:
                           ("Blonde", "bd_blonde")]:
             ttk.Radiobutton(of, text=txt, variable=self.overlay_active,
                             value=val).pack(anchor="w", pady=1)
+            
+        tk.Label(of, text="Hair Style", bg=BG1, fg=T1,
+         font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(6, 0))
+
+        hair_style_box = ttk.Combobox(
+            of,
+            textvariable=self.hair_style_var,
+            values=["none", "long"],
+            state="readonly",
+            width=18,
+        )
+        hair_style_box.pack(anchor="w", pady=2)
+        hair_style_box.bind("<<ComboboxSelected>>", lambda _e: self.apply_processing())
+
+        tk.Label(of, text="Hair Color", bg=BG1, fg=T1,
+                font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(6, 0))
+
+        hair_color_box = ttk.Combobox(
+            of,
+            textvariable=self.hair_color_var,
+            values=["original", "black", "brown", "blonde", "red", "blue", "gray"],
+            state="readonly",
+            width=18,
+        )
+        hair_color_box.pack(anchor="w", pady=2)
+        hair_color_box.bind("<<ComboboxSelected>>", lambda _e: self.apply_processing())
         _sep(p)
 
         # ── view ──────────────────────────────────────────────────────────
@@ -1037,6 +1066,9 @@ class PhotoixApp:
                 _ov     = self.overlay_active.get()
                 glasses = _ov[3:] if _ov.startswith("sg_") else "none"
                 beard   = _ov[3:] if _ov.startswith("bd_") else "none"
+                hair_style = self.hair_style_var.get()
+                hair_color = self.hair_color_var.get()
+
 
                 if lm is not None and (smile + eyebrow + lip + slim) > 0.01:
                     src_pts, dst_pts = compute_combined_displacement(
@@ -1070,7 +1102,7 @@ class PhotoixApp:
                     except Exception as e:
                         _log.warning(f"High-pass filter failed: {e}")
 
-                if lm is not None and (glasses != "none" or beard != "none"):
+                if lm is not None and (glasses != "none" or beard != "none" or hair_style != "none"):
                     effects_list, params = [], {}
                     if glasses != "none":
                         effects_list.append("sunglasses")
@@ -1078,6 +1110,12 @@ class PhotoixApp:
                     if beard != "none":
                         effects_list.append("beard")
                         params["beard"] = {"color": beard}
+                    if hair_style != "none":
+                        effects_list.append("hair")
+                        params["hair"] = {
+                            "style": hair_style,
+                            "color": hair_color,
+                        }
                     result = FaceOverlayEngine(lm, img).apply(effects_list, params)
                     img = result.final_image
 
@@ -1128,7 +1166,15 @@ class PhotoixApp:
         self.proc_img = self.orig_img.copy()
         self.metrics  = {}
         self.fft_data = {}
-        defaults = dict(smile=0.0, eyebrow=0.0, lip=0.0, slim=0.0, sigma=50.0)
+        defaults = dict(
+            smile=0.0,
+            eyebrow=0.0,
+            lip=0.0,
+            slim=0.0,
+            sigma=50.0,
+            lowpass_sigma=0.0,
+            highpass_sigma=0.0,
+        )
         for k, v in defaults.items():
             self._sv[k] = v
         for row in self._slider_rows:
