@@ -1,0 +1,10 @@
+{
+  "long": {
+    "file": "long.png",
+    "label": "Long Hair",
+    "scale_x": 2.55,
+    "scale_y": 1.1,
+    "offset_x": 34,
+    "offset_y": 0.31
+  }
+}
