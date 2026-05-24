@@ -214,18 +214,30 @@ def apply_highpass_filter(
         raise ValueError(f"Unknown filter type: {filter_type}")
     
     hp_kernel = 1.0 - lp_kernel
-    
-    # Apply to each channel
+
+    # Apply FFT high-pass. For color input we convert to grayscale first so
+    # edges aren't muddled by per-channel cancellation — the visible result
+    # is a clean luminance edge map.
     if is_color:
-        result = np.zeros_like(img, dtype=np.float32)
-        for c in range(min(3, img.shape[2])):
-            result[:, :, c] = _fft_filter_channel(img[:, :, c], hp_kernel)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        result = _fft_filter_channel(gray, hp_kernel)
     else:
         result = _fft_filter_channel(img, hp_kernel)
-    
-    # Center the result around 128 (high-pass typically has zero DC component)
-    result = np.clip(result + 128, 0, 255).astype(img.dtype)
-    return result
+
+    # Make edges visible: take magnitude of the signed HP signal, then
+    # stretch the dynamic range to [0, 255] so flat regions are black
+    # and edges are bright (equivalent to cv2.NORM_MINMAX on |HP|).
+    mag = np.abs(result).astype(np.float32)
+    peak = float(mag.max())
+    if peak > 1e-6:
+        mag = mag * (255.0 / peak)
+    edges: np.ndarray = np.clip(mag, 0, 255).astype(np.uint8)
+
+    # If input was color, return 3-channel so callers/tests see the same
+    # shape they passed in.
+    if is_color:
+        edges = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+    return edges
 
 
 def apply_bandpass_filter(
@@ -356,30 +368,40 @@ def apply_spatial_lowpass(img: np.ndarray, kernel_size: int = 5, sigma: float = 
 
 def apply_spatial_highpass(img: np.ndarray, kernel_size: int = 5) -> np.ndarray:
     """Apply Laplacian high-pass filter in spatial domain.
-    
+
+    Returns a clean edge image (|Laplacian| normalized to [0, 255]), not
+    a sharpened copy of the input. Flat regions render black, edges
+    render bright.
+
     Args:
         img: Input image
         kernel_size: Kernel size for Laplacian (must be odd, typically 3, 5, or 7)
-    
+
     Returns:
-        Spatially high-pass filtered image (edge-enhanced)
+        Edge-magnitude image with same shape and dtype as input.
     """
     if kernel_size % 2 == 0:
         kernel_size += 1
-    
+
     is_color = len(img.shape) == 3
-    result = np.zeros_like(img, dtype=np.float32)
-    
+
+    # Edges are luminance-based; run Laplacian on grayscale to avoid
+    # per-channel cancellation.
     if is_color:
-        for c in range(3):
-            laplacian = cv2.Laplacian(img[:, :, c].astype(np.float32), cv2.CV_32F, ksize=kernel_size)
-            result[:, :, c] = img[:, :, c].astype(np.float32) - laplacian
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     else:
-        laplacian = cv2.Laplacian(img.astype(np.float32), cv2.CV_32F, ksize=kernel_size)
-        result = img.astype(np.float32) - laplacian
-    
-    result = np.clip(result, 0, 255).astype(img.dtype)
-    return result
+        gray = img
+    laplacian = cv2.Laplacian(gray.astype(np.float32), cv2.CV_32F, ksize=kernel_size)
+
+    mag = np.abs(laplacian)
+    peak = float(mag.max())
+    if peak > 1e-6:
+        mag = mag * (255.0 / peak)
+    edges: np.ndarray = np.clip(mag, 0, 255).astype(np.uint8)
+
+    if is_color:
+        edges = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+    return edges
 
 
 def apply_unsharp_mask(

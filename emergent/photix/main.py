@@ -36,6 +36,12 @@ from core.fft_analyzer      import compare_spectra, compute_magnitude_spectrum
 from core.metrics           import compute_all_metrics
 from core.report_exporter   import export_csv, export_pdf, save_image
 from effects.overlays       import FaceOverlayEngine
+from live.video             import process_video
+from live.pipeline          import LivePipeline
+
+# Fixed Gaussian high-pass cutoff. The HP toggle is on/off only — a slider
+# here just changed which edge scale was extracted, not whether edges showed.
+HIGHPASS_FIXED_SIGMA = 5.0
 
 # ── DESIGN TOKENS ─────────────────────────────────────────────────────────────
 BG0    = "#06080F"
@@ -267,7 +273,7 @@ class PhotoixApp:
         self._cam_candidate_idx = 0
 
         # slider values
-        self._sv           = dict(smile=0.0, eyebrow=0.0, lip=0.0, slim=0.0, sigma=50.0, 
+        self._sv           = dict(smile=0.0, eyebrow=0.0, lip=0.0, slim=0.0, sigma=50.0,
                                   lowpass_sigma=0.0, highpass_sigma=0.0)
         self._slider_rows  : list[_SliderRow] = []
 
@@ -279,6 +285,14 @@ class PhotoixApp:
         self.highpass_enabled   = tk.BooleanVar(value=False)
         self.hair_style_var     = tk.StringVar(value="none")
         self.hair_color_var     = tk.StringVar(value="original")
+
+        # live / video control vars (drive the LIVE WARPING sidebar panel)
+        self.live_effect_var       = tk.StringVar(value="none")
+        self.live_intensity_var    = tk.DoubleVar(value=0.6)
+        self.live_beard_var        = tk.StringVar(value="none")
+        self.live_sunglasses_var   = tk.StringVar(value="none")
+        self.live_hair_style_var   = tk.StringVar(value="none")
+        self.live_hair_color_var   = tk.StringVar(value="original")
 
 
         self._setup_window()
@@ -376,6 +390,90 @@ class PhotoixApp:
         self._file_lbl.pack(padx=10, anchor="w", pady=(0, 4))
         _sep(p)
 
+        # ── live / video ──────────────────────────────────────────────────
+        _sect(p, "LIVE  /  VIDEO")
+
+        # Warp/aging dropdown. Overlays below are independent and stack.
+        lv = tk.Frame(p, bg=BG1)
+        lv.pack(fill=tk.X, padx=10, pady=(2, 1))
+        tk.Label(lv, text="Warp/Age", bg=BG1, fg=T1,
+                 font=FS, width=8, anchor="w").pack(side=tk.LEFT)
+        live_effect_box = ttk.Combobox(
+            lv, textvariable=self.live_effect_var,
+            values=["none", "age", "deage", "smile", "eyebrow",
+                    "lip_wide", "face_slim", "surprise",
+                    "beard", "sunglasses", "hair"],
+            state="readonly", width=14,
+        )
+        live_effect_box.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Intensity slider for the selected warp/aging mode.
+        iv = tk.Frame(p, bg=BG1)
+        iv.pack(fill=tk.X, padx=10, pady=(0, 2))
+        tk.Label(iv, text="Intensity", bg=BG1, fg=T1,
+                 font=FS, width=8, anchor="w").pack(side=tk.LEFT)
+        tk.Scale(iv, from_=0.0, to=1.0, resolution=0.05,
+                 orient=tk.HORIZONTAL,
+                 bg=BG1, fg=T1, troughcolor=BG3,
+                 activebackground=CYAN, highlightthickness=0, bd=0,
+                 showvalue=True, length=140, width=8,
+                 variable=self.live_intensity_var
+                 ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Beard color
+        bv = tk.Frame(p, bg=BG1)
+        bv.pack(fill=tk.X, padx=10, pady=(0, 1))
+        tk.Label(bv, text="Beard", bg=BG1, fg=T1,
+                 font=FS, width=8, anchor="w").pack(side=tk.LEFT)
+        ttk.Combobox(bv, textvariable=self.live_beard_var,
+                     values=["none", "black", "brown", "blonde"],
+                     state="readonly", width=14
+                     ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Sunglasses style
+        gv = tk.Frame(p, bg=BG1)
+        gv.pack(fill=tk.X, padx=10, pady=(0, 1))
+        tk.Label(gv, text="Glasses", bg=BG1, fg=T1,
+                 font=FS, width=8, anchor="w").pack(side=tk.LEFT)
+        ttk.Combobox(gv, textvariable=self.live_sunglasses_var,
+                     values=["none", "classic", "aviator", "round", "glasses"],
+                     state="readonly", width=14
+                     ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Hair style
+        hv = tk.Frame(p, bg=BG1)
+        hv.pack(fill=tk.X, padx=10, pady=(0, 1))
+        tk.Label(hv, text="Hair", bg=BG1, fg=T1,
+                 font=FS, width=8, anchor="w").pack(side=tk.LEFT)
+        ttk.Combobox(hv, textvariable=self.live_hair_style_var,
+                     values=["none", "long"],
+                     state="readonly", width=14
+                     ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Hair color
+        hc = tk.Frame(p, bg=BG1)
+        hc.pack(fill=tk.X, padx=10, pady=(0, 2))
+        tk.Label(hc, text="HairCol", bg=BG1, fg=T1,
+                 font=FS, width=8, anchor="w").pack(side=tk.LEFT)
+        ttk.Combobox(hc, textvariable=self.live_hair_color_var,
+                     values=["original", "black", "brown", "blonde",
+                             "red", "blue", "gray"],
+                     state="readonly", width=14
+                     ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Action buttons
+        _Btn(p, "Start Live Warp", self.start_live_warp,
+             accent=CYAN, fg=BG0, icon="▶").pack(fill=tk.X, padx=8, pady=(4, 1))
+        _Btn(p, "Process Video File…", self.process_video_file,
+             accent=BG3, icon="📹").pack(fill=tk.X, padx=8, pady=(0, 2))
+        tk.Label(p,
+                 text="  Live keys:  1 Aging  2 Smile  3 Brow  4 Slim\n"
+                      "              5 Beard  6 Glasses  7 Hair  0 Off\n"
+                      "              +/- intensity   S=snap   Q=quit",
+                 bg=BG1, fg=T2, font=FS, justify=tk.LEFT
+                 ).pack(padx=10, anchor="w", pady=(0, 4))
+        _sep(p)
+
         # ── landmarks ─────────────────────────────────────────────────────
         _sect(p, "LANDMARKS")
         self._lm_btn = _Btn(p, "Show Landmarks", self.toggle_landmarks,
@@ -435,20 +533,26 @@ class PhotoixApp:
         of.pack(fill=tk.X, padx=14, pady=(0, 4))
         tk.Label(of, text="Off", bg=BG1, fg=T1,
                  font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(2, 0))
-        ttk.Radiobutton(of, text="None", variable=self.overlay_active,
-                        value="none").pack(anchor="w", pady=1)
+        ttk.Radiobutton(
+            of, text="None", variable=self.overlay_active, value="none",
+            command=self._apply_processing_if_image_loaded,
+        ).pack(anchor="w", pady=1)
         tk.Label(of, text="Sunglasses", bg=BG1, fg=T1,
                  font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(6, 0))
         for txt, val in [("Classic", "sg_classic"), ("Aviator", "sg_aviator"),
                           ("Round", "sg_round"), ("Clear", "sg_glasses")]:
-            ttk.Radiobutton(of, text=txt, variable=self.overlay_active,
-                            value=val).pack(anchor="w", pady=1)
+            ttk.Radiobutton(
+                of, text=txt, variable=self.overlay_active, value=val,
+                command=self._apply_processing_if_image_loaded,
+            ).pack(anchor="w", pady=1)
         tk.Label(of, text="Beard", bg=BG1, fg=T1,
                  font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(6, 0))
         for txt, val in [("Black", "bd_black"), ("Brown", "bd_brown"),
                           ("Blonde", "bd_blonde")]:
-            ttk.Radiobutton(of, text=txt, variable=self.overlay_active,
-                            value=val).pack(anchor="w", pady=1)
+            ttk.Radiobutton(
+                of, text=txt, variable=self.overlay_active, value=val,
+                command=self._apply_processing_if_image_loaded,
+            ).pack(anchor="w", pady=1)
             
         tk.Label(of, text="Hair Style", bg=BG1, fg=T1,
          font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(6, 0))
@@ -461,7 +565,10 @@ class PhotoixApp:
             width=18,
         )
         hair_style_box.pack(anchor="w", pady=2)
-        hair_style_box.bind("<<ComboboxSelected>>", lambda _e: self.apply_processing())
+        hair_style_box.bind(
+            "<<ComboboxSelected>>",
+            lambda _e: self._apply_processing_if_image_loaded(),
+        )
 
         tk.Label(of, text="Hair Color", bg=BG1, fg=T1,
                 font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(6, 0))
@@ -474,7 +581,10 @@ class PhotoixApp:
             width=18,
         )
         hair_color_box.pack(anchor="w", pady=2)
-        hair_color_box.bind("<<ComboboxSelected>>", lambda _e: self.apply_processing())
+        hair_color_box.bind(
+            "<<ComboboxSelected>>",
+            lambda _e: self._apply_processing_if_image_loaded(),
+        )
         _sep(p)
 
         # ── view ──────────────────────────────────────────────────────────
@@ -510,6 +620,11 @@ class PhotoixApp:
         tk.Frame(p, height=20, bg=BG1).pack()
 
     # ── MAIN AREA ─────────────────────────────────────────────────────────────
+    def _apply_processing_if_image_loaded(self):
+        """Reprocess the still image after sidebar changes without warning spam."""
+        if self.orig_img is not None:
+            self.apply_processing()
+
     def _build_main_area(self):
         self._main = tk.Frame(self.root, bg=BG0)
         self._main.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
@@ -541,7 +656,6 @@ class PhotoixApp:
             ("Face Slim",      "slim",             0.0,   1.0,  0.0,  PINK),
             ("Aging σ",        "sigma",            1.0, 100.0, 50.0,  AMBER),
             ("LP Filter σ",    "lowpass_sigma",    0.0,  40.0,  0.0,  CYAN),
-            ("HP Filter σ",    "highpass_sigma",   0.0,  30.0,  0.0,  VIOLET),
         ]
         self._slider_rows = []
         for lbl, key, vmin, vmax, init, color in specs:
@@ -1089,33 +1203,33 @@ class PhotoixApp:
                     except Exception as e:
                         _log.warning(f"Low-pass filter failed: {e}")
                 
-                # High-pass (sharpening) - blend for visible enhancement
-                if self.highpass_enabled.get() and self._sv["highpass_sigma"] > 0.5:
+                # High-pass — show the Gaussian HP edge map directly.
+                # Sigma is fixed: the σ slider only changed which edge scale
+                # was extracted, not whether edges showed, so the toggle is a
+                # simple on/off.
+                if self.highpass_enabled.get():
                     try:
-                        hp_sigma = float(self._sv["highpass_sigma"])
-                        hp_result = apply_highpass_filter(img, sigma=hp_sigma, filter_type=FilterType.GAUSSIAN)
-                        # Blend: keep 70% original, add 30% high-pass for enhancement
-                        blend_amt = min(0.5, hp_sigma / 100.0)  # Scale blend by sigma
-                        img = cv2.addWeighted(img.astype(np.float32), 0.7, 
-                                             hp_result.astype(np.float32), 0.3 * blend_amt, 0)
-                        img = np.clip(img, 0, 255).astype(np.uint8)
+                        img = apply_highpass_filter(
+                            img, sigma=HIGHPASS_FIXED_SIGMA,
+                            filter_type=FilterType.GAUSSIAN,
+                        )
                     except Exception as e:
                         _log.warning(f"High-pass filter failed: {e}")
 
                 if lm is not None and (glasses != "none" or beard != "none" or hair_style != "none"):
                     effects_list, params = [], {}
-                    if glasses != "none":
-                        effects_list.append("sunglasses")
-                        params["sunglasses"] = {"style": glasses}
-                    if beard != "none":
-                        effects_list.append("beard")
-                        params["beard"] = {"color": beard}
                     if hair_style != "none":
                         effects_list.append("hair")
                         params["hair"] = {
                             "style": hair_style,
                             "color": hair_color,
                         }
+                    if glasses != "none":
+                        effects_list.append("sunglasses")
+                        params["sunglasses"] = {"style": glasses}
+                    if beard != "none":
+                        effects_list.append("beard")
+                        params["beard"] = {"color": beard}
                     result = FaceOverlayEngine(lm, img).apply(effects_list, params)
                     img = result.final_image
 
@@ -1127,8 +1241,11 @@ class PhotoixApp:
                     "Aging": aging, "Smile": smile, "Eyebrow": eyebrow,
                     "Lip Wide": lip, "Face Slim": slim, "Sigma": sigma,
                     "LowPass": self.lowpass_enabled.get(), "LowPass σ": self._sv["lowpass_sigma"],
-                    "HighPass": self.highpass_enabled.get(), "HighPass σ": self._sv["highpass_sigma"],
+                    "HighPass": self.highpass_enabled.get(),
+                    "HighPass σ": HIGHPASS_FIXED_SIGMA if self.highpass_enabled.get() else 0.0,
                     "Overlay": _ov,
+                    "Hair Style": hair_style,
+                    "Hair Color": hair_color,
                     "Timestamp": datetime.now().isoformat(),
                 }
                 self.root.after(0, self._on_processing_done)
@@ -1159,6 +1276,197 @@ class PhotoixApp:
         messagebox.showerror("Processing error", msg)
         self._set_status("Processing failed.")
 
+    # ── LIVE WARP  /  VIDEO FILE (integrated) ─────────────────────────────────
+    def _build_live_pipeline(self) -> LivePipeline:
+        """Snapshot every relevant sidebar control into a LivePipeline.
+
+        The live pipeline mirrors PhotoixApp.apply_processing exactly, so
+        the live webcam / video processor produce identical results to
+        the static-image preview given the same sidebar settings.
+
+        Sources (priority — later wins where they overlap):
+          1. The LIVE / VIDEO panel (live_*_var)
+          2. The static AGING / DE-AGING radio + Aging σ slider
+          3. The static FACE OVERLAYS radio (sunglasses, beard, hair)
+          4. The static expression sliders (smile, eyebrow, lip_wide, slim)
+          5. The static FREQUENCY FILTERS checkboxes + sigma sliders
+        """
+        pipe = LivePipeline()
+
+        # ── seed from LIVE / VIDEO dropdowns ─────────────────────────────
+        live_effect = self.live_effect_var.get()
+        live_int    = float(self.live_intensity_var.get())
+        if live_effect == "age":
+            pipe.aging       = "age"
+            pipe.aging_sigma = max(1.0, min(100.0, live_int * 100.0))
+        elif live_effect == "deage":
+            pipe.aging       = "deage"
+            pipe.aging_sigma = max(1.0, min(100.0, live_int * 100.0))
+        elif live_effect == "smile":
+            pipe.smile = live_int
+        elif live_effect == "eyebrow":
+            pipe.eyebrow = live_int
+        elif live_effect == "lip_wide":
+            pipe.lip_wide = live_int
+        elif live_effect == "face_slim":
+            pipe.face_slim = live_int
+        elif live_effect == "surprise":
+            pipe.eyebrow  = live_int
+            pipe.lip_wide = live_int * 0.6
+        elif live_effect == "beard":
+            live_beard = self.live_beard_var.get() or "none"
+            pipe.beard = live_beard if live_beard != "none" else "black"
+        elif live_effect == "sunglasses":
+            live_sunglasses = self.live_sunglasses_var.get() or "none"
+            pipe.sunglasses = (
+                live_sunglasses if live_sunglasses != "none" else "classic"
+            )
+        elif live_effect == "hair":
+            live_hair_style = self.live_hair_style_var.get() or "none"
+            pipe.hair_style = live_hair_style if live_hair_style != "none" else "long"
+            pipe.hair_color = self.live_hair_color_var.get() or "original"
+
+        # ── Independent LIVE overlay pickers (stack onto the dropdown) ───
+        # Beard / sunglasses / hair each have their own combobox in the
+        # LIVE panel. Any non-"none" value stacks onto the pipeline so the
+        # user can mix glasses + beard + long hair simultaneously.
+        live_beard = (self.live_beard_var.get() or "none").strip()
+        if live_beard != "none" and pipe.beard == "none":
+            pipe.beard = live_beard
+        live_sg = (self.live_sunglasses_var.get() or "none").strip()
+        if live_sg != "none" and pipe.sunglasses == "none":
+            pipe.sunglasses = live_sg
+        live_hair = (self.live_hair_style_var.get() or "none").strip()
+        if live_hair != "none" and pipe.hair_style == "none":
+            pipe.hair_style = live_hair
+            pipe.hair_color = (self.live_hair_color_var.get() or "original").strip()
+
+        # ── merge static-image sidebar choices (stack on top) ────────────
+        # Static aging radio overrides the live aging if explicitly set.
+        static_aging = self.aging_var.get()
+        if static_aging in ("age", "deage"):
+            pipe.aging = static_aging
+            pipe.aging_sigma = max(1.0, min(100.0,
+                float(self._sv.get("sigma", pipe.aging_sigma))))
+
+        # Static FACE OVERLAYS radio (overlay_active uses "sg_" / "bd_"
+        # prefixes; static hair has its own dedicated var).
+        _ov = self.overlay_active.get() or "none"
+        if _ov.startswith("sg_") and pipe.sunglasses == "none":
+            pipe.sunglasses = _ov[3:]
+        elif _ov.startswith("bd_") and pipe.beard == "none":
+            pipe.beard = _ov[3:]
+        static_hair_style = (self.hair_style_var.get() or "none").strip()
+        if static_hair_style != "none" and pipe.hair_style == "none":
+            pipe.hair_style = static_hair_style
+            pipe.hair_color = (self.hair_color_var.get() or "original").strip()
+
+        # Static expression sliders — stack additively with anything from
+        # the LIVE panel (max so a higher slider value wins).
+        pipe.smile     = max(pipe.smile,     float(self._sv.get("smile",   0.0)))
+        pipe.eyebrow   = max(pipe.eyebrow,   float(self._sv.get("eyebrow", 0.0)))
+        pipe.lip_wide  = max(pipe.lip_wide,  float(self._sv.get("lip",     0.0)))
+        pipe.face_slim = max(pipe.face_slim, float(self._sv.get("slim",    0.0)))
+
+        # Static frequency filter checkboxes.
+        if self.lowpass_enabled.get():
+            pipe.lowpass_enabled = True
+            pipe.lowpass_sigma = max(0.5, float(self._sv.get("lowpass_sigma", 12.0)))
+        if self.highpass_enabled.get():
+            pipe.highpass_enabled = True
+            # HP slider was removed in the static panel — use the same
+            # fixed cutoff so live mirrors the static-image preview.
+            pipe.highpass_sigma = HIGHPASS_FIXED_SIGMA
+
+        return pipe
+
+    def _write_pipeline_config(self, pipe: LivePipeline) -> Path:
+        """Serialize a LivePipeline to a temp file for subprocess handoff."""
+        import tempfile, json as _json
+        fd, path = tempfile.mkstemp(prefix="photix_live_",
+                                    suffix=".json", text=True)
+        with __import__("os").fdopen(fd, "w", encoding="utf-8") as f:
+            _json.dump(pipe.to_dict(), f)
+        return Path(path)
+
+    def start_live_warp(self):
+        """Open the OpenCV live warping window seeded with current settings.
+
+        Runs the webcam loop in a *subprocess* (not a thread) so:
+          * cv2.imshow / cv2.waitKey always run on a real main thread
+            (some OpenCV builds misbehave when imshow is called from a
+            background thread inside another GUI process).
+          * If the live loop crashes, the Tk app stays alive and the error
+            prints to the terminal that launched main.py.
+        """
+        import subprocess
+
+        # Free the in-app camera preview so it can't fight us for the device.
+        if self.camera_running:
+            self.close_camera()
+
+        pipe = self._build_live_pipeline()
+        cfg_path = self._write_pipeline_config(pipe)
+
+        cmd = [
+            sys.executable, "-m", "live.webcam",
+            "--config", str(cfg_path),
+        ]
+        try:
+            self._live_proc = subprocess.Popen(cmd, cwd=str(_HERE))
+        except Exception as exc:
+            messagebox.showerror("Live Warp",
+                                 f"Could not start live warp:\n{exc}")
+            return
+
+        self._set_status(
+            f"Live warp opening  ·  {pipe.label()[:48]}  ·  "
+            f"PID={self._live_proc.pid}"
+        )
+
+    def process_video_file(self):
+        """Pick a video, run process_video() in a worker thread, show progress."""
+        if self._processing:
+            return
+        path = filedialog.askopenfilename(
+            title="Open video file",
+            filetypes=[("Videos", "*.mp4 *.avi *.mov *.mkv"),
+                       ("MP4",    "*.mp4"),
+                       ("AVI",    "*.avi"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+
+        pipe = self._build_live_pipeline()
+        self._processing = True
+        self._start_spinner(f"Processing video  ·  {pipe.label()[:36]}…")
+
+        def _runner():
+            try:
+                out = process_video(path,
+                                    pipeline=pipe,
+                                    show_progress=True)
+                self.root.after(0, lambda p=out: self._on_video_done(p))
+            except Exception as exc:
+                err = str(exc)
+                self.root.after(0, lambda m=err: self._on_video_error(m))
+
+        threading.Thread(target=_runner, daemon=True).start()
+
+    def _on_video_done(self, out_path: Path):
+        self._processing = False
+        self._stop_spinner()
+        name = Path(out_path).name
+        self._set_status(f"Video saved: {name}")
+        messagebox.showinfo("Video processed",
+                            f"Saved to:\n{out_path}")
+
+    def _on_video_error(self, msg: str):
+        self._processing = False
+        self._stop_spinner()
+        messagebox.showerror("Video processing failed", msg)
+        self._set_status("Video processing failed.")
+
     # ── RESET ─────────────────────────────────────────────────────────────────
     def reset(self):
         if self.orig_img is None:
@@ -1179,6 +1487,9 @@ class PhotoixApp:
             self._sv[k] = v
         for row in self._slider_rows:
             row.reset(defaults[row._key])
+        self.overlay_active.set("none")
+        self.hair_style_var.set("none")
+        self.hair_color_var.set("original")
         if self.current_view == "images":
             self._refresh_images()
         self._set_status("Reset to original.")
@@ -1240,7 +1551,31 @@ class PhotoixApp:
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    root = tk.Tk()
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        print(
+            "Tk desktop UI could not start because this Python/Tcl install "
+            f"is not usable:\n{exc}\n\n"
+            "Starting the Photix web UI fallback instead. Open the URL shown "
+            "below in your browser.",
+            file=sys.stderr,
+            flush=True,
+        )
+        try:
+            from ui import main as web_main
+            web_main()
+        except Exception as web_exc:
+            print(
+                "\nWeb UI fallback also failed.\n"
+                "You can still run live directly from emergent/photix with:\n"
+                "  python -m live.webcam --beard brown --sunglasses glasses "
+                "--hair-style long\n\n"
+                f"Web UI error: {web_exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return
     try:
         from ctypes import windll
         windll.shcore.SetProcessDpiAwareness(1)

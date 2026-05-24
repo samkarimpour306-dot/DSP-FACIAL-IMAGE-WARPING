@@ -6,6 +6,10 @@ scikit-image>=0.21.0
 matplotlib>=3.7.0
 Pillow>=10.0.0
 
+# Live / video features (live/ package + ui.py)
+tqdm>=4.66.0
+gradio>=4.0.0
+
 # Cloud aging (optional — needed for replicate_aging.py)
 replicate>=0.25.0
 requests>=2.31.0

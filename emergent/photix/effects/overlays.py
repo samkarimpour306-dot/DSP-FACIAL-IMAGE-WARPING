@@ -20,6 +20,16 @@ try:
 except ImportError:
     _FaceLandmarks = None
 
+try:
+    from utils.landmark_indices import FACE_OVAL as _FACE_OVAL
+except ImportError:
+    _FACE_OVAL = [
+        10, 338, 297, 332, 284, 251, 389, 356, 454,
+        323, 361, 288, 397, 365, 379, 378, 400, 377,
+        152, 148, 176, 149, 150, 136, 172, 58, 132,
+        93, 234, 127, 162, 21, 54, 103, 67, 109,
+    ]
+
 _ASSETS_DIR = Path(__file__).parent / "assets"
 _HAIR_DIR = _ASSETS_DIR / "hair"
 _log = logging.getLogger(__name__)
@@ -118,6 +128,43 @@ def _rotate_asset(img_rgba: np.ndarray, angle_deg: float) -> np.ndarray:
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=(0, 0, 0, 0),
     )
+
+
+def _rotate_asset_with_anchor(
+    img_rgba: np.ndarray,
+    angle_deg: float,
+    anchor_xy: tuple[float, float],
+) -> tuple[np.ndarray, tuple[float, float]]:
+    """Rotate BGRA image and return the anchor's position in the new canvas."""
+    h, w = img_rgba.shape[:2]
+    M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle_deg, 1.0)
+    cos_a, sin_a = abs(M[0, 0]), abs(M[0, 1])
+    new_w = int(h * sin_a + w * cos_a)
+    new_h = int(h * cos_a + w * sin_a)
+    M[0, 2] += (new_w - w) / 2.0
+    M[1, 2] += (new_h - h) / 2.0
+    rotated = cv2.warpAffine(
+        img_rgba, M, (new_w, new_h),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0, 0),
+    )
+    anchor = M @ np.array([anchor_xy[0], anchor_xy[1], 1.0], dtype=np.float32)
+    return rotated, (float(anchor[0]), float(anchor[1]))
+
+
+def _alpha_blend_at_anchor(
+    bg: np.ndarray,
+    fg_rgba: np.ndarray,
+    target_xy: tuple[float, float],
+    anchor_xy: tuple[float, float],
+    alpha_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Paste fg_rgba so its anchor lands exactly on target_xy."""
+    fh, fw = fg_rgba.shape[:2]
+    center_x = target_xy[0] + fw * 0.5 - anchor_xy[0]
+    center_y = target_xy[1] + fh * 0.5 - anchor_xy[1]
+    return alpha_blend(bg, fg_rgba, (int(round(center_x)), int(round(center_y))), alpha_mask)
 
 
 def _pt(lm: np.ndarray, idx: int) -> tuple[float, float]:
@@ -462,6 +509,52 @@ def _beard_region_mask(
     mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=edge_sigma, sigmaY=edge_sigma)
     mask *= 1.0 - np.clip(lip_guard, 0.0, 1.0)
     return np.clip(mask, 0.0, 1.0)
+
+
+def _hair_behind_face_alpha_mask(
+    image_shape: tuple[int, int],
+    lm: np.ndarray,
+) -> np.ndarray:
+    """Allow hair around the head while preventing it from covering the face.
+
+    Guard = inside the FACE_OVAL polygon (precise silhouette from MediaPipe).
+    Returns ``1.0 - guard`` so that the alpha multiplier is 0 on the face
+    and 1 everywhere outside (scalp, behind ears, neck, shoulders).
+    """
+    h, w = image_shape[:2]
+    face_w = max(_dist(lm, 234, 454), _dist(lm, 127, 356), 1.0)
+
+    pts = []
+    n = lm.shape[0]
+    for idx in _FACE_OVAL:
+        if idx < n:
+            pts.append((float(lm[idx, 0]), float(lm[idx, 1])))
+    if len(pts) < 3:
+        return np.ones((h, w), dtype=np.float32)
+
+    poly = np.array(pts, dtype=np.int32).reshape(-1, 1, 2)
+    guard = np.zeros((h, w), dtype=np.float32)
+    cv2.fillPoly(guard, [poly], 1.0, lineType=cv2.LINE_AA)
+
+    # Slight outward dilation so the soft feather still fully covers the
+    # face silhouette after blurring.
+    guard_px = max(2, int(round(face_w * 0.02)))
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (guard_px * 2 + 1, guard_px * 2 + 1),
+    )
+    guard = cv2.dilate(
+        np.clip(guard * 255.0, 0, 255).astype(np.uint8),
+        kernel,
+        iterations=1,
+    ).astype(np.float32) / 255.0
+    guard = cv2.GaussianBlur(
+        guard,
+        (0, 0),
+        sigmaX=max(1.0, face_w * 0.012),
+        sigmaY=max(1.0, face_w * 0.012),
+    )
+    return 1.0 - np.clip(guard, 0.0, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -916,6 +1009,60 @@ def _procedural_beard(
 
     return np.clip(out, 0, 255).astype(np.uint8)
 
+
+def _remove_original_hair(image: np.ndarray, lm: np.ndarray) -> np.ndarray:
+    """Inpaint the head/hair region above and around the face so that the
+    user's original hair is erased before a wig is composited on top.
+
+    Strategy (no segmentation model needed):
+      1. Build a generous "head silhouette" rectangle that covers where
+         hair typically lives (above the face oval, slightly past the
+         temples on each side).
+      2. Subtract the face oval interior so we never repaint the face.
+      3. cv2.inpaint(TELEA) — neighboring pixels (background, sky, wall)
+         flow inward and fill the masked region.
+
+    This is a heuristic, not real hair segmentation: ponytails extending
+    well past the rectangle won't be erased, and detailed hair edges may
+    leave faint halos. The wig overlay covers most artifacts.
+    """
+    h, w = image.shape[:2]
+    n = lm.shape[0]
+    pts = [(float(lm[i, 0]), float(lm[i, 1])) for i in _FACE_OVAL if i < n]
+    if len(pts) < 3:
+        return image
+
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    face_left, face_right = min(xs), max(xs)
+    face_top, face_bot = min(ys), max(ys)
+    face_w = max(1.0, face_right - face_left)
+    face_h = max(1.0, face_bot - face_top)
+
+    mask = np.zeros((h, w), dtype=np.uint8)
+    x1 = max(0, int(round(face_left  - face_w * 0.45)))
+    x2 = min(w, int(round(face_right + face_w * 0.45)))
+    y1 = max(0, int(round(face_top   - face_h * 0.75)))
+    y2 = min(h, int(round(face_top   + face_h * 0.20)))
+    if x2 <= x1 or y2 <= y1:
+        return image
+    mask[y1:y2, x1:x2] = 255
+
+    face_poly = np.array(pts, dtype=np.int32).reshape(-1, 1, 2)
+    face_interior = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(face_interior, [face_poly], 255)
+    # Shrink the face guard slightly so we still clean the hairline edge.
+    shrink = max(2, int(round(face_w * 0.03)))
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (shrink * 2 + 1, shrink * 2 + 1)
+    )
+    face_interior = cv2.erode(face_interior, kernel, iterations=1)
+    mask = cv2.bitwise_and(mask, cv2.bitwise_not(face_interior))
+
+    radius = max(3, int(round(face_w * 0.04)))
+    return cv2.inpaint(image, mask, radius, cv2.INPAINT_TELEA)
+
+
 def apply_hair(
     image: np.ndarray,
     landmarks: np.ndarray,
@@ -976,23 +1123,28 @@ def apply_hair(
     hair[:, :, 3] = cv2.GaussianBlur(hair[:, :, 3], (5, 5), 0)
 
     lm = landmarks
-    p234 = _pt(lm, 234)
-    p454 = _pt(lm, 454)
     p10 = _pt(lm, 10)
     p152 = _pt(lm, 152)
     p33 = _pt(lm, 33)
     p263 = _pt(lm, 263)
 
-    face_width = max(_dist(lm, 234, 454), 1.0)
+    face_width = max(_dist(lm, 234, 454), _dist(lm, 127, 356), 1.0)
     face_height = max(_dist(lm, 10, 152), 1.0)
 
     roll_deg = math.degrees(math.atan2(p263[1] - p33[1], p263[0] - p33[0]))
     roll_deg += rotation_offset_deg
+    roll_rad = math.radians(roll_deg)
+    axis_x = np.array([math.cos(roll_rad), math.sin(roll_rad)], dtype=np.float32)
+    axis_y = np.array([-math.sin(roll_rad), math.cos(roll_rad)], dtype=np.float32)
 
-    scale_x = float(entry.get("scale_x", 1.6))
+    scale_x = float(entry.get("scale_x", 2.25))
     scale_y = float(entry.get("scale_y", 1.15))
-    meta_offset_x = int(entry.get("offset_x", 0))
-    meta_offset_y_ratio = float(entry.get("offset_y", -0.55))
+    anchor_x_ratio = float(entry.get("anchor_x", 0.5))
+    anchor_y_ratio = float(entry.get("anchor_y", 0.22))
+    target_offset_x = float(entry.get("target_offset_x", 0.0))
+    target_offset_y = float(entry.get("target_offset_y", 0.025))
+    catalog_offset_x_px = float(entry.get("offset_x", 0.0))
+    catalog_offset_y_ratio = float(entry.get("offset_y", 0.0))
 
     ah, aw = hair.shape[:2]
     target_w = max(8, int(face_width * scale_x * scale_multiplier))
@@ -1002,12 +1154,32 @@ def apply_hair(
     interp = cv2.INTER_AREA if target_w < aw else cv2.INTER_CUBIC
     hair = cv2.resize(hair, (target_w, target_h), interpolation=interp)
 
-    rotated = _rotate_asset(hair, -roll_deg)
+    anchor_xy = (
+        float(np.clip(anchor_x_ratio, 0.0, 1.0) * max(target_w - 1, 1)),
+        float(np.clip(anchor_y_ratio, 0.0, 1.0) * max(target_h - 1, 1)),
+    )
+    rotated, rotated_anchor = _rotate_asset_with_anchor(hair, -roll_deg, anchor_xy)
 
-    center_x = int(p10[0] + meta_offset_x + offset_x)
-    center_y = int(p10[1] + target_h * meta_offset_y_ratio + offset_y)
+    # Align the hair asset's forehead anchor to the face hairline instead of
+    # guessing from the asset center. Offsets are applied in face-local axes.
+    target = (
+        np.array(p10, dtype=np.float32)
+        + axis_x * (face_width * target_offset_x + catalog_offset_x_px + float(offset_x))
+        + axis_y * (face_height * (target_offset_y + catalog_offset_y_ratio) + float(offset_y))
+    )
 
-    return alpha_blend(image, rotated, (center_x, center_y))
+    # Erase the user's original hair first so the wig sits on a clean
+    # head silhouette instead of mixing with the underlying strands.
+    cleaned = _remove_original_hair(image, lm)
+
+    face_alpha_mask = _hair_behind_face_alpha_mask(image.shape[:2], lm)
+    return _alpha_blend_at_anchor(
+        cleaned,
+        rotated,
+        (float(target[0]), float(target[1])),
+        rotated_anchor,
+        alpha_mask=face_alpha_mask,
+    )
 
 # ---------------------------------------------------------------------------
 # FaceOverlayEngine  (delegates to module-level functions)
